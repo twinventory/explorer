@@ -1,0 +1,39 @@
+import type { XyzDslBoxSpec, XyzDslContentSpec, XyzDslMaterialSpec, XyzDslModelSpec } from '../xyzdsl/types';
+import type { SpatialGeometry } from './geometry';
+import type { SpatialTransform } from './transform';
+
+export interface SpatialBounds {
+  minX: number;
+  maxX: number;
+  minY: number;
+  maxY: number;
+  minZ: number;
+  maxZ: number;
+}
+
+export interface SpatialNode {
+  surfaceVisibility?: { transform: SpatialTransform; observable?: import('../xyzdsl/types').XyzDslObservable };
+  modelCsgOperations?: import('./csg').CsgOperationNode[];
+  /** World-space half spaces; points with nonnegative signed distance remain visible. */
+  clippingPlanes?: import('./clipping').ClipPlane[];
+  light?: import('../xyzdsl/types').XyzDslLightSpec;
+  id: string;
+  source: string;
+  box: XyzDslBoxSpec;
+  bounds: SpatialBounds;
+  material: XyzDslMaterialSpec;
+  content?: XyzDslContentSpec;
+  model?: XyzDslModelSpec;
+  geometry: SpatialGeometry;
+  transform: SpatialTransform;
+  localTransform?: SpatialTransform;
+  worldTransform?: SpatialTransform;
+  namespacePath?: string;
+  parentNamespacePath?: string;
+  renderable?: boolean;
+  unionGroupId?: string;
+  csgExpressionId?: string;
+  csgConsumed?: boolean;
+  children?: SpatialNode[];
+  metadata?: Record<string, unknown>;
+}

@@ -1,0 +1,405 @@
+import { gridLayout, gridCost, gridTopology, type Triple } from './boxGrid';
+import { surfaceFrame } from './surfaceAttachment';
+import { SURFACE_DIRECTIONS } from './boxSurfaceParser';
+import { canonicalNamespacePath } from './pathParser';
+import type { ResolvedSpatialObject } from './resolveDocument';
+import type { AxisName, ParseDiagnostic } from './types';
+
+const AXES = ['x', 'y', 'z'] as const;
+const SIZES = ['width', 'height', 'depth'] as const;
+export const MAX_LAYOUT_INSTANCES = 10000;
+
+/** Resolve parent-relative boxes and expand subtrees before transforms, bounds and CSG. */
+export function resolveLayout(
+  objects: ResolvedSpatialObject[], diagnostics: ParseDiagnostic[], templates: Set<string>,
+): ResolvedSpatialObject[] {
+  const byNamespace = new Map<string, ResolvedSpatialObject>();
+  for (const object of objects) if (object.namespacePath && !byNamespace.has(object.namespacePath)) byNamespace.set(object.namespacePath, object);
+  const children = new Map<ResolvedSpatialObject | undefined, ResolvedSpatialObject[]>();
+  for (const object of objects) {
+    let parent: ResolvedSpatialObject | undefined;
+    for (let length = object.namespace.length - 1; length > 0; length--) {
+      parent = byNamespace.get(canonicalNamespacePath(object.namespace.slice(0, length)));
+      if (parent) break;
+    }
+    children.set(parent, [...(children.get(parent) ?? []), object]);
+  }
+  const result: ResolvedSpatialObject[] = [];
+  let generated = 0;
+  const budgetExceeded = new Error('layout-budget');
+  const report = (object: ResolvedSpatialObject, message: string) => diagnostics.push({ line: object.lineNumber, source: object.source, message });
+
+  function visit(object: ResolvedSpatialObject, parent?: ResolvedSpatialObject, originalParent?: ResolvedSpatialObject, attached = false, cellResolved = false): void {
+    if (object.boxGrid?.invalid || object.cell?.invalid) return;
+    if (object.selfOrigin === 'invalid') return;
+    const selfOrigin = object.selfOrigin === 'auto' ? undefined : object.selfOrigin;
+    if (selfOrigin) {
+      if (object.surface || object.cell) {
+        report(object, 'self-origin cannot be combined with surface or cell; those declarations define their own interior coordinate frames.');
+        return;
+      }
+      if (!parent?.boxSurface) {
+        if (![...templates].some(path => object.namespacePath.startsWith(path))) report(object, 'self-origin requires a nearest concrete box-shell parent.');
+        return;
+      }
+    }
+
+    if (object.cell && !cellResolved) {
+      const layout = parent?.gridLayout;
+      if (!parent || !layout) {
+        if (![...templates].some(path => object.namespacePath.startsWith(path))) report(object, 'cell requires a nearest concrete box-grid parent.');
+        return;
+      }
+      const selected = object.cell.indices;
+      if (selected?.some((n, i) => n > layout.counts[i])) { report(object, 'cell indices are outside the parent box-grid.'); return; }
+      const regions = layout.regions ?? Array.from({ length: layout.counts[0] }, (_, x) =>
+        Array.from({ length: layout.counts[1] }, (_, y) => Array.from({ length: layout.counts[2] }, (_, z) => {
+          const start: Triple = [x, y, z];
+          return { name: '', start, end: start, origin: start.map((n, a) => layout.offsets![a][n]) as Triple, size: start.map((n, a) => layout.tracks![a][n]) as Triple };
+        })).flat()).flat();
+      const targets = regions.filter(r => object.cell!.name ? r.name === object.cell!.name : selected ? selected.every((n, a) => n - 1 >= r.start[a] && n - 1 <= r.end[a]) : true);
+      if (!targets.length) { report(object, 'cell targets an omitted cell or unknown named area.'); return; }
+      for (const region of targets) {
+        if (++generated > MAX_LAYOUT_INSTANCES) throw budgetExceeded;
+        const indices = region.start;
+        const origin = region.origin.map((n, i) => layout.inset[i] + n);
+        const namespace = [...parent.namespace, `#cell-${object.id}-${indices.join(',')}`];
+        const boundaries: ResolvedSpatialObject['cellBoundaryPanels'] = {};
+        const near = ['left', 'bottom', 'front'] as const, far = ['right', 'top', 'back'] as const;
+        for (let i = 0; i < 3; i++) {
+          if (indices[i] > 0) boundaries[near[i]] = `${parent.id}#partition-grid`;
+          else if (parent.boxSurface?.faces[near[i]]) boundaries[near[i]] = `${parent.id}#surface-${near[i]}`;
+          if (region.end[i] < layout.counts[i] - 1) boundaries[far[i]] = `${parent.id}#partition-grid`;
+          else if (parent.boxSurface?.faces[far[i]]) boundaries[far[i]] = `${parent.id}#surface-${far[i]}`;
+        }
+        const segments: ResolvedSpatialObject['cellBoundarySegments'] = {};
+        if (layout.areas) {
+          for (let axis = 0; axis < 3; axis++) for (const sign of [-1, 1]) {
+            const face = sign < 0 ? near[axis] : far[axis];
+            const boundary = sign < 0 ? region.start[axis] : region.end[axis] + 1;
+            const outer = boundary === 0 || boundary === layout.counts[axis];
+            const u = (axis + 1) % 3, v = (axis + 2) % 3;
+            segments[face] = [];
+            for (let a = region.start[u]; a <= region.end[u]; a++) for (let b = region.start[v]; b <= region.end[v]; b++) {
+              const q = [...region.start]; q[u] = a; q[v] = b; q[axis] = sign < 0 ? boundary - 1 : boundary;
+              const omitted = !outer && layout.areas[q[2]][q[1]][q[0]] === '.';
+              if ((outer || omitted) && !parent.boxSurface?.faces[face]) continue;
+              const panelId = outer ? `${parent.id}#surface-${face}` : omitted ? `${parent.id}#notch-${face}-${boundary}` : `${parent.id}#partition-grid`;
+              const clips = [u, v].map(t => {
+                const n = q[t];
+                const start = n === region.start[t] ? 0 : layout.offsets![t][n] - region.origin[t] - layout.thickness / 2;
+                const end = n === region.end[t] ? region.size[t] : layout.offsets![t][n] + layout.tracks![t][n] - region.origin[t] + layout.thickness / 2;
+                return { axis: AXES[t], start, extent: end - start };
+              });
+              segments[face]!.push({ panelId, clips });
+            }
+            // Avoid clipping/duplicating a finish when the whole rectangular face shares one panel.
+            const faceSegments = segments[face]!;
+            const expected = (region.end[u] - region.start[u] + 1) * (region.end[v] - region.start[v] + 1);
+            if (faceSegments.length === expected && faceSegments.every(s => s.panelId === faceSegments[0].panelId)) {
+              segments[face] = [{ panelId: faceSegments[0].panelId, clips: [] }];
+            }
+            boundaries[face] = segments[face]![0]?.panelId;
+          }
+        }
+        const anchor: ResolvedSpatialObject = {
+          ...object, id: `${parent.id}#cell-${object.id}-${indices.join(',')}`, namespace,
+          namespacePath: canonicalNamespacePath(namespace), parentNamespacePath: parent.namespacePath,
+          box: { source: object.box.source, x: origin[0], y: origin[1], z: origin[2], width: region.size[0], height: region.size[1], depth: region.size[2] },
+          transform: { rotation: [0, 0, 0], diagnostics: [] }, geometry: { kind: 'box', diagnostics: [] },
+          model: { fit: 'contain', align: 'center', diagnostics: [] }, content: { diagnostics: [] }, light: undefined, viewPoint: false,
+          cell: undefined, boxGrid: undefined, gridLayout: undefined, boxSurface: undefined, surface: undefined,
+          cellFrame: true, cellIndices: indices.map(n => n + 1) as Triple, cellBoundaryPanels: boundaries, cellBoundarySegments: layout.areas ? segments : undefined, gridOwnerId: parent.id,
+          renderable: false, repeat: undefined, repeatClip: undefined, anchorScale: undefined, referenceDimensions: undefined,
+        };
+        result.push(anchor);
+        visit(object, anchor, originalParent, attached, true);
+      }
+      return;
+    }
+
+    if (object.surface && !attached) {
+      if (object.surface.invalid) return;
+      if (!parent?.boxSurface && !parent?.cellBoundaryPanels) {
+        if (![...templates].some(path => object.namespacePath.startsWith(path))) report(object, 'surface requires a nearest concrete box-shell parent.');
+        return;
+      }
+      if (object.content.kind || object.light || object.viewPoint) { report(object, 'surface attachments support primitives and models, not content, lights or viewpoints.'); return; }
+      const near = ['left','bottom','front'] as const, far = ['right','top','back'] as const;
+      const inset = near.map(f => parent.boxSurface?.faces[f]?.thickness ?? 0);
+      const size = SIZES.map((s,i) => parent.box[s] / (parent.anchorScale?.[i] ?? 1) - inset[i] - (parent.boxSurface?.faces[far[i]]?.thickness ?? 0));
+      for (const face of object.surface.faces) {
+        const panelId = parent.cellBoundaryPanels ? parent.cellBoundaryPanels[face] : parent.boxSurface?.faces[face] ? `${parent.id}#surface-${face}` : undefined;
+        if (!panelId) { if (object.surface.explicit) report(object, `surface targets missing ${face} panel; attachment omitted.`); continue; }
+        let segments: { panelId: string; clips?: ResolvedSpatialObject['repeatClip'] }[] = parent.cellBoundarySegments?.[face] ?? [{ panelId, clips: undefined }];
+        if (parent.gridLayout?.areas && !parent.cellBoundaryPanels) {
+          const grid = parent.gridLayout;
+          const axis = near.includes(face as typeof near[number]) ? near.indexOf(face as typeof near[number]) : far.indexOf(face as typeof far[number]);
+          const isNear = near[axis] === face;
+          segments = grid.regions!.filter(r => isNear ? r.start[axis] === 0 : r.end[axis] === grid.counts[axis] - 1).map(r => ({
+            panelId, clips: AXES.flatMap((axisName, a) => a === axis ? [] : [{ axis: axisName, start: grid.inset[a] + r.origin[a], extent: r.size[a] }]),
+          }));
+        }
+        if (!segments.length && object.surface.explicit) report(object, `surface targets missing ${face} panel; attachment omitted.`);
+        for (const [segmentIndex, segment] of segments.entries()) {
+          if (++generated > MAX_LAYOUT_INSTANCES) throw budgetExceeded;
+          const frame = surfaceFrame(face, size, inset);
+          const namespace = [...parent.namespace, `#attach-${object.id}-${face}${(parent.cellBoundarySegments || parent.gridLayout?.areas) ? `-${segmentIndex}` : ''}`];
+          const anchor: ResolvedSpatialObject = {
+            ...object, id: `${parent.id}#attach-${object.id}-${face}${(parent.cellBoundarySegments || parent.gridLayout?.areas) ? `-${segmentIndex}` : ''}`, namespace,
+            namespacePath: canonicalNamespacePath(namespace), parentNamespacePath: parent.namespacePath,
+            box: { source: object.box.source, x: frame.position[0], y: frame.position[1], z: frame.position[2], width: frame.size[0], height: frame.size[1], depth: frame.size[2] },
+            transform: { rotation: frame.rotation as [number,number,number], diagnostics: [] },
+            renderable: false, attachmentFrame: true, attachmentEnclosureId: parent.gridOwnerId ?? parent.id, repeatGroupId: `${parent.id}#attachment-group-${object.id}`, attachedPanelId: segment.panelId,
+            cell: undefined, boxGrid: undefined, gridLayout: undefined, cellFrame: false, cellBoundaryPanels: undefined, cellBoundarySegments: undefined, cellIndices: parent.cellIndices,
+            surface: undefined, boxSurface: undefined, repeat: undefined, repeatClip: segment.clips,
+            anchorScale: undefined, referenceDimensions: undefined, model: { fit: 'contain', align: 'center', diagnostics: [] },
+            geometry: { kind: 'box', diagnostics: [] },
+          };
+          result.push(anchor);
+          visit(object, anchor, originalParent, true, true);
+        }
+      }
+      return;
+    }
+    const box = { ...object.box };
+    const fill = box.fillAxes ?? [];
+    const end = box.endAxes ?? [];
+    const repeat = object.repeat;
+    const dynamic = fill.length > 0 || end.length > 0 || repeat !== undefined;
+    if (object.boxSurface?.invalid) return;
+    if (repeat?.invalid) return; // The property parser already diagnosed this declaration.
+    if (dynamic && !parent) {
+      // Unanchored template definitions are resolved in the context of each reference.
+      if (![...templates].some(path => object.namespacePath.startsWith(path))) report(object, 'Parent fill, far-edge alignment and repetition require a concrete parent anchor.');
+      return;
+    }
+    if (repeat?.axes.some(axis => fill.includes(axis))) {
+      report(object, 'An axis cannot both fill its parent and repeat.');
+      return;
+    }
+    // Authored children use the interior origin; generated panels remain in the outer frame.
+    const nearFaces = ['left', 'bottom', 'front'] as const;
+    const farFaces = ['right', 'top', 'back'] as const;
+    const outsideOrigin = (selfOrigin ?? parent?.boxSurface?.origin) === 'outside';
+    const inset = nearFaces.map(face => outsideOrigin ? 0 : parent?.boxSurface?.faces[face]?.thickness ?? 0);
+    const extents = SIZES.map((size, index) => parent
+      ? parent.box[size] / (parent.anchorScale?.[index] ?? 1) - inset[index] - (outsideOrigin ? 0 : parent.boxSurface?.faces[farFaces[index]]?.thickness ?? 0)
+      : 0);
+    const surface = object.boxSurface;
+    const panelSums = nearFaces.map((face, a) => (surface?.faces[face]?.thickness ?? 0) + (surface?.faces[farFaces[a]]?.thickness ?? 0));
+    if (object.referenceDimensions?.some(size => !Number.isFinite(size) || size <= 0)) {
+      report(object, 'ref-scale requires definite positive template dimensions; declare a fixed template anchor when its children use parent fill.');
+      return;
+    }
+    // Resolve all placement against physical outer extents, including filled and repeated shells.
+    if (surface?.sizing === 'inside') {
+      for (let a = 0; a < 3; a++) {
+        if (fill.includes(AXES[a])) continue;
+        const declared = box[SIZES[a]];
+        const referenceOuter = object.referenceDimensions?.[a];
+        const referenceClear = referenceOuter === undefined ? undefined : referenceOuter - panelSums[a];
+        if (!(declared > 0) || (referenceClear !== undefined && !(referenceClear > 0))) {
+          report(object, 'box-shell-sizing: inside requires positive clear dimensions, including the reference template interior.');
+          return;
+        }
+        box[SIZES[a]] = referenceOuter === undefined ? declared + panelSums[a] : declared * referenceOuter / referenceClear!;
+      }
+    }
+    for (const axis of end) {
+      const index = AXES.indexOf(axis);
+      const extent = extents[index];
+      const size = box[SIZES[index]];
+      const tolerance = 8 * Number.EPSILON * Math.max(Math.abs(extent), Math.abs(size));
+      if (!Number.isFinite(extent) || extent <= 0 || size - extent > tolerance) {
+        report(object, 'Far-edge alignment requires a finite positive parent extent and a size no larger than that extent.');
+        return;
+      }
+      box[axis] = Math.max(0, extent - size);
+    }
+    delete box.endAxes;
+    for (const axis of fill) {
+      const index = AXES.indexOf(axis);
+      box[SIZES[index]] = extents[index] - box[axis];
+    }
+    delete box.fillAxes;
+    if (SIZES.some(size => !Number.isFinite(box[size]) || box[size] <= 0) || AXES.some(axis => !Number.isFinite(box[axis]))) {
+      report(object, 'Layout requires finite positive dimensions; a filled axis must start before the parent edge.');
+      return;
+    }
+    let anchorScale = object.anchorScale;
+    if (object.referenceDimensions) {
+      anchorScale = SIZES.map((size, index) => box[size] / object.referenceDimensions![index]) as [number, number, number];
+    }
+    const localSizes = SIZES.map((size, index) => box[size] / (anchorScale?.[index] ?? 1));
+    if (surface && (object.geometry.kind !== 'box' || object.geometry.operation || object.geometry['box-radius'] || object.geometry.puff || object.model.source || object.content.kind || object.light || object.viewPoint)) {
+      report(object, 'box-shell supports plain boxes only; model, content, light, view-point, CSG and deformed geometry combinations are unsupported.');
+      return;
+    }
+    if (surface && localSizes.some((size, index) => !Number.isFinite(size) || (surface.faces[(['left', 'bottom', 'front'] as const)[index]]?.thickness ?? 0) + (surface.faces[(['right', 'top', 'back'] as const)[index]]?.thickness ?? 0) >= size)) {
+      report(object, 'box-shell requires opposing panel thickness sums to be smaller than every resolved local box dimension.');
+      return;
+    }
+    let layout: ReturnType<typeof gridLayout>;
+    if (object.boxGrid) {
+      if (!surface) { report(object, 'box-grid requires a box-shell enclosure.'); return; }
+      const gridInset = nearFaces.map(f => surface.faces[f]?.thickness ?? 0) as Triple;
+      const gridSize = localSizes.map((size, i) => size - gridInset[i] - (surface.faces[farFaces[i]]?.thickness ?? 0)) as Triple;
+      if (!Number.isSafeInteger(gridCost(object.boxGrid.counts)) || (object.boxGrid.areas ? object.boxGrid.counts.reduce((n, c) => n * (2 * c + 1), 1) : gridCost(object.boxGrid.counts)) > MAX_LAYOUT_INSTANCES) throw budgetExceeded;
+      layout = gridLayout(object.boxGrid, gridSize, gridInset);
+      if (!layout) { report(object, 'box-grid requires box-partition for internal tracks, positive clear track lengths that fit the enclosure, and a nonempty area map matching the grid whose named regions are rectangular cuboids.'); return; }
+      if (!Number.isSafeInteger(gridCost(layout.counts)) || gridCost(layout.counts) > MAX_LAYOUT_INSTANCES) throw budgetExceeded;
+    }
+    const counts = AXES.map((axis, index) => {
+      if (!repeat?.axes.includes(axis)) return 1;
+      const pitch = box[SIZES[index]] + repeat.gap;
+      if (repeat.edge === 'clip') {
+        // Emit only copies whose starting edge is strictly inside the parent.
+        const ratio = (extents[index] - box[axis]) / pitch;
+        return Math.max(0, Math.ceil(ratio - 8 * Number.EPSILON * Math.max(1, Math.abs(ratio))));
+      }
+      const ratio = (extents[index] - box[axis] + repeat.gap) / pitch;
+      // Compensate only for floating point round-off at an exact-fit boundary.
+      return Math.max(0, Math.floor(ratio + 8 * Number.EPSILON * Math.max(1, Math.abs(ratio))));
+    });
+    const count = counts.reduce((a, b) => a * b, 1);
+    if (!Number.isFinite(count) || count > MAX_LAYOUT_INSTANCES) {
+      report(object, `Repetition exceeds the ${MAX_LAYOUT_INSTANCES} instance limit.`);
+      return;
+    }
+    const namespace = parent && originalParent
+      ? [...parent.namespace, ...object.namespace.slice(originalParent.namespace.length)]
+      : object.namespace;
+    for (let x = 0; x < counts[0]; x++) for (let y = 0; y < counts[1]; y++) for (let z = 0; z < counts[2]; z++) {
+      const indices: [number, number, number] = [x, y, z];
+      const repeated = repeat !== undefined || parent?.repeatSourceId !== undefined || Boolean(parent?.attachedPanelId) || Boolean(parent?.cellFrame);
+      if (repeated && ++generated > MAX_LAYOUT_INSTANCES) {
+        throw budgetExceeded;
+      }
+      // Internal-only suffix cannot collide with a source namespace (which excludes #).
+      const instanceNamespace = [...namespace];
+      if (repeat) instanceNamespace[instanceNamespace.length - 1] += `#repeat${indices.join(',')}`;
+      const instanceBox = { ...box };
+      AXES.forEach((axis: AxisName, index) => {
+        instanceBox[axis] += inset[index];
+        if (repeat?.axes.includes(axis)) instanceBox[axis] += indices[index] * (box[SIZES[index]] + repeat.gap);
+      });
+      const instance: ResolvedSpatialObject = {
+        ...object, box: instanceBox, anchorScale, gridLayout: layout,
+        cellIndices: parent?.cellIndices,
+        attachedPanelId: parent?.attachedPanelId,
+        attachmentEnclosureId: parent?.attachmentEnclosureId,
+        repeatGroupId: parent?.attachmentFrame ? parent.repeatGroupId : repeat ? `${parent?.id ?? ''}#repeat-group-${object.id}` : parent?.repeatGroupId ? `${parent.repeatGroupId}/${object.id}` : undefined,
+        ...(repeat?.edge === 'clip' ? {
+          repeatClip: repeat.axes.map(axis => ({ axis, extent: extents[AXES.indexOf(axis)], start: inset[AXES.indexOf(axis)] })),
+        } : {}),
+        namespace: instanceNamespace,
+        namespacePath: canonicalNamespacePath(instanceNamespace),
+        parentNamespacePath: parent?.namespacePath ?? object.parentNamespacePath,
+        id: repeated ? `${object.id}@${canonicalNamespacePath(instanceNamespace)}` : object.id,
+        ...(repeated ? { repeatSourceId: object.id, repeatIndices: repeat ? indices : parent?.repeatIndices } : {}),
+      };
+      if (layout) {
+        generated += layout.areas ? layout.counts.reduce((n, c) => n * (2 * c + 1), 1) : gridCost(layout.counts);
+        if (generated > MAX_LAYOUT_INSTANCES) throw budgetExceeded;
+      }
+      if (surface) instance.renderable = false;
+      result.push(instance);
+      const topology = layout?.areas ? gridTopology(layout, farFaces.map(f => surface!.faces[f]?.thickness ?? 0) as Triple) : undefined;
+      if (surface && object.layoutEligible) {
+        const [width, height, depth] = localSizes;
+        const thickness = (face: import('./types').SurfaceFace) => surface.faces[face]?.thickness ?? 0;
+        const top = thickness('top'), bottom = thickness('bottom'), front = thickness('front'), back = thickness('back'), left = thickness('left'), right = thickness('right');
+        const panels = [
+          ['top', 0, height - top, 0, width, top, depth],
+          ['bottom', 0, 0, 0, width, bottom, depth],
+          ['front', 0, 0, 0, width, height, front],
+          ['back', 0, 0, depth - back, width, height, back],
+          ['left', 0, 0, 0, left, height, depth],
+          ['right', width - right, 0, 0, right, height, depth],
+        ] as const;
+        // Anonymous surfaces need an internal anchor namespace for parenting.
+        if (!instance.namespace.length) {
+          instance.namespace = [`#surface${instance.id}`];
+          instance.namespacePath = canonicalNamespacePath(instance.namespace);
+        }
+        for (const [face, px, py, pz, pw, ph, pd] of panels) {
+          const panel = surface.faces[face];
+          if (!panel || (topology && !topology[`surface-${face}`])) continue;
+          const visibility = surface.observable[face] ?? instance.material.observable;
+          const panelLayout = topology?.[`surface-${face}`];
+          const panelOrigin = panelLayout?.meshOrigin ?? [px, py, pz];
+          const panelSize = panelLayout?.size ?? [pw, ph, pd];
+          if (++generated > MAX_LAYOUT_INSTANCES) throw budgetExceeded;
+          const panelNamespace = [...instance.namespace, `#surface-${face}`];
+          result.push({
+            ...instance,
+            id: `${instance.id}#surface-${face}`,
+            namespace: panelNamespace,
+            namespacePath: canonicalNamespacePath(panelNamespace),
+            parentNamespacePath: instance.namespacePath,
+            box: { source: object.box.source, x: panelOrigin[0], y: panelOrigin[1], z: panelOrigin[2], width: panelSize[0], height: panelSize[1], depth: panelSize[2] },
+            partitionGrid: panelLayout,
+            material: { ...instance.material, color: panel.color, observable: visibility === true ? SURFACE_DIRECTIONS[face] : visibility },
+            geometry: { kind: 'box', diagnostics: [] },
+            transform: { rotation: [0, 0, 0], diagnostics: [] },
+            reference: { diagnostics: [] },
+            boxGrid: undefined, gridLayout: undefined, cell: undefined,
+            boxSurface: undefined, repeat: undefined, repeatClip: undefined,
+            anchorScale: undefined, referenceDimensions: undefined,
+            surfaceSourceId: instance.id, surfaceFace: face,
+            renderable: true,
+          });
+        }
+      }
+      if (topology) for (const [key, meshLayout] of Object.entries(topology)) {
+        if (!key.startsWith('notch-')) continue;
+        const face = key.split('-')[1] as import('./types').SurfaceFace;
+        const panel = surface!.faces[face];
+        if (!panel) continue;
+        const namespace = [...instance.namespace, `#${key}`];
+        const [px, py, pz] = meshLayout.meshOrigin!, [pw, ph, pd] = meshLayout.size;
+        const visibility = surface!.observable[face] ?? instance.material.observable;
+        if (++generated > MAX_LAYOUT_INSTANCES) throw budgetExceeded;
+        result.push({
+          ...instance, id: `${instance.id}#${key}`, namespace,
+          namespacePath: canonicalNamespacePath(namespace), parentNamespacePath: instance.namespacePath,
+          box: { source: object.box.source, x: px, y: py, z: pz, width: pw, height: ph, depth: pd },
+          material: { ...instance.material, color: panel.color, observable: visibility === true ? SURFACE_DIRECTIONS[face] : visibility },
+          geometry: { kind: 'box', diagnostics: [] }, transform: { rotation: [0, 0, 0], diagnostics: [] }, reference: { diagnostics: [] },
+          boxGrid: undefined, gridLayout: undefined, cell: undefined, boxSurface: undefined, repeat: undefined, repeatClip: undefined,
+          anchorScale: undefined, referenceDimensions: undefined, partitionGrid: meshLayout, surfaceSourceId: instance.id, surfaceFace: face,
+          renderable: true,
+        });
+      }
+      if (layout && layout.counts.some(n => n > 1) && (!topology || topology['partition-grid'])) {
+        const namespace = [...instance.namespace, '#partition-grid'];
+        const meshLayout = topology?.['partition-grid'] ?? layout;
+        const [px, py, pz] = meshLayout.meshOrigin ?? meshLayout.inset, [pw, ph, pd] = meshLayout.size;
+        result.push({
+          ...instance, id: `${instance.id}#partition-grid`, namespace,
+          namespacePath: canonicalNamespacePath(namespace), parentNamespacePath: instance.namespacePath,
+          box: { source: object.box.source, x: px, y: py, z: pz, width: pw, height: ph, depth: pd },
+          material: { ...instance.material, color: object.boxGrid!.partition!.color, observable: false },
+          geometry: { kind: 'box', diagnostics: [] }, transform: { rotation: [0, 0, 0], diagnostics: [] }, reference: { diagnostics: [] },
+          boxGrid: undefined, gridLayout: undefined, cell: undefined, boxSurface: undefined, repeat: undefined, repeatClip: undefined,
+          anchorScale: undefined, referenceDimensions: undefined, partitionGrid: meshLayout, surfaceSourceId: instance.id,
+          renderable: true,
+        });
+      }
+      for (const child of children.get(object) ?? []) visit(child, instance, object);
+    }
+  }
+  for (const root of children.get(undefined) ?? []) {
+    const checkpoint = result.length;
+    const generatedCheckpoint = generated;
+    try { visit(root); }
+    catch (error) {
+      if (error !== budgetExceeded) throw error;
+      result.splice(checkpoint);
+      generated = generatedCheckpoint;
+      report(root, `Layout generation exceeds the ${MAX_LAYOUT_INSTANCES} generated-instance budget; this root subtree was omitted.`);
+    }
+  }
+  return result;
+}

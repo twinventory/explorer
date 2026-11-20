@@ -1,0 +1,442 @@
+# XYZ Web Explorer
+
+The primary public-release application for exploring and editing XYZDSL spatial documents in the browser. This directory is self-contained: install, test, build, and deploy it independently.
+
+## Run locally
+
+```bash
+npm install
+npm run dev
+```
+
+## Camera navigation
+
+Desktop and Editor mode default to orbit; drag to orbit and scroll/pinch to zoom. There is no camera type selector.
+
+Add invisible **traversable view points** to offer a fixed-position tour, especially on mobile:
+
+```xyzdsl
+"+1+2/+3+4/+5+6":"view-point: true"
+"+2+1/+1+1/+2+1":"view-point: true; rotation: 0,90,0"
+```
+
+The camera sits at the center of the marker box (the first example is `(2, 5, 8)`), using the usual world transforms for nested markers. `rotation` sets its initial direction in degrees; without rotation it looks along negative Z with Y up. Markers occupy no visible geometry, collision surfaces, or room bounds. `view-point: false` behaves as ordinary geometry; invalid values produce a diagnostic. This property marks individual concrete leaf instances, and is not inherited by children or namespace defaults. Reference copies of marked instances retain the marker.
+
+In **Editor** mode, view points appear as cyan translucent boxes with an arrow showing their initial viewing direction (negative local Z). Ctrl/Command-click a marker to select it, or select it in the Definition tree. The usual Move, Resize, and Rotate controls and shortcuts edit its XYZDSL declaration; moving or resizing the box changes its camera center, and rotating changes its initial heading. Selected markers show the usual yellow selection bounds. These authoring helpers disappear outside Editor mode and during tours, and never contribute collision surfaces or room bounds.
+
+When markers exist, **Start tour** enters the first point. Points follow declaration order. The camera stays fixed at each point: mouse dragging or touch swiping pivots horizontally and vertically. Use the **Previous** and **Next** overlay buttons to traverse on all devices; desktop also supports Down/Page Down for next and Up/Page Up for previous when not typing in a control. Traversal loops in both directions: Next from the last point returns to the first, and Previous from the first returns to the last. On desktop, **Exit tour** or Escape restores the previous orbit pose. Editing/scene selection is available in orbit; changing the document exits a desktop tour. On mobile, scenes with view points automatically open at the first point, with no exit action or instruction bar. Left/right overlay buttons traverse the points; swiping looks around. A single-point tour hides the redundant traversal buttons. Mobile Editor mode and scenes without view points use orbit.
+
+In **Editor** mode, hold Ctrl (Windows/Linux) or Command (macOS) while scrolling over the scene to rotate the selected object; unmodified scrolling continues to zoom the orbit camera. Ctrl/Command with `+` or `-` resizes all axes. Ctrl/Command with `X`, `Y`, or `Z` increases only that axis, and adding Shift decreases it. Press `[` to toggle the linear transform step between fine (1 cm) and coarse (1 m), or `]` to toggle the rotation angle between fine (1°) and coarse (15°). The Properties dropdowns and all transform shortcuts share these settings.
+
+
+## Deploy to GitHub Pages
+
+This repository includes a GitHub Actions workflow that builds the Vite app and deploys the `dist` artifact to GitHub Pages whenever changes are pushed to `main`. You can also run the deployment manually from the **Actions** tab by selecting **Deploy to GitHub Pages** and choosing **Run workflow**.
+
+In the repository settings, set **Pages** → **Build and deployment** → **Source** to **GitHub Actions**. The workflow automatically builds with the repository name as the Vite base path so project pages load assets from the correct URL.
+
+## Spatial declaration example
+
+Each declaration lays out a primitive inside an edge-based X/Y/Z bounding box. The optional `geometry` property defaults to `box` and currently supports `box`, `cylinder`, `cone`, and `sphere`. Boxes can also set `box-radius` in the same project units as path coordinates to render rounded edges and `puff: 0..5` to make cushion-like boxes use a softer rounded silhouette while keeping the same layout, transform, collision, and union contract.
+
+A spatial declaration is one quoted path/property line. Declaration keys can be anonymous world-space boxes, named spatial instances, namespace declarations, or child instances inside a named parent namespace. Namespaces use slash-separated identifiers before the final three coordinate segments. Namespace declarations end in `/` and do not render by themselves; they define inherited defaults for matching child instances. A prototype namespace is a reusable namespace intended for references. A reference instance uses the `ref` property to copy material, geometry, and transform defaults from a previously declared namespace and applies them to the referencing instance's own box.
+
+Named entries are replaceable: when a later namespace declaration has the same namespace as an earlier namespace declaration, or a later spatial instance has the same namespace as an earlier instance, the later entry overwrites rather than merges with the earlier one. Properties omitted from the replacement do not survive. The matching key is the complete slash-separated path before the three XYZ segments, so two `Sofa/Cushion/...` instances replace one another even when their coordinates differ. Declaration-only defaults and concrete instances remain complementary—for example, `Sofa/` can still provide defaults to a `Sofa/...` instance. Anonymous paths, which begin directly with XYZ segments, have no namespace key and are never overwritten.
+
+References are evaluated in declaration order. They use the newest matching target available above the `ref` line, so a later target redeclaration does not retroactively change or invalidate an existing reference:
+
+```txt
+"Sofa/" : "color: brown"
+"SeatA/+0d+4d/+0d+2d/+0d+3d" : "ref: Sofa/"
+"Sofa/" : "color: blue"
+"SeatB/+5d+4d/+0d+2d/+0d+3d" : "ref: Sofa/"
+```
+
+Here `SeatA/` uses brown and `SeatB/` uses blue.
+
+Path coordinates use metres: a bare integer is metres, while `d`, `c`, and `m` suffixes denote decimetres, centimetres, and millimetres. Suffixes apply independently to each number, so `+1d+3m` means a 1 dm offset and a 3 mm size. Decimal path notation is avoided; use an exact metric suffix instead.
+
+Boolean composition operations (`operation: union`, `operation: subtraction`, and `operation: intersection`) follow declaration order and are implemented with CSG internally. A later overlapping operator first targets earlier solids in the same namespace/local scope; if no local scoped target overlaps, it falls back to the earlier overlapping world-space solid. This lets compound objects be authored as local groups, but the group must still have a concrete namespace anchor to materialize its children:
+
+```txt
+"Mug/+0d+1d/+0d+1d/+0d+1d" : "color: 0xf5f3ef"
+"Mug/Body/+5d+2d/+1d+2d/+1d+2d" : "geometry: cylinder; roughness: 0.65"
+"Mug/Hollow/+530m+140m/+120m+190m/+130m+140m" : "geometry: cylinder; operation: subtraction"
+"Mug/Handle/+680m+110m/+155m+110m/+135m+130m" : "box-radius: 0.018; operation: union"
+"Mug/HandleHole/+700m+70m/+175m+70m/+155m+90m" : "box-radius: 0.012; operation: subtraction"
+```
+
+Spatial transaction validation may limit each memo/properties field to 100 bytes, but that is a transport constraint rather than a renderer limit. A spatial transaction is a remote transaction whose path and memo/properties payload map into one spatial declaration. Once declarations are loaded, the renderer consumes the resolved spatial document and does not impose a practical size limit on the inherited property set. Authors targeting the remote format can fit richer scenes into the 100-byte fields by putting shared material, geometry, and deformation properties on namespace declarations, then letting child instances inherit those defaults or add compact overrides across additional declarations.
+
+```txt
+"+2d+4d/+0d+6d/+1d+3d" : "geometry: box; box-radius: 0.015; color: 0x333333; metalness: 0.8; roughness: 0.2"
+"Sofa/+7d+4d/+0d+3d/+0d+2d" : "color: brown; metalness: 0.2; roughness: 0.8"
+"Sofa/Cushion/" : "color: 0xf5f3ef; metalness: 0; roughness: 0.88; puff: 5"
+"Seat/+3d+5d/+0d+3d/+0d+15d" : "ref: Sofa/"
+
+"Table/+18d+8d/+0d+5d/+4d+8d" : "color: white; metalness: 0.8; roughness: 0.2"
+"Table/Top/+0d+8d/+4d+1d/+0d+8d" : ""
+"Table/LegA/+0d+1d/+0d+5d/+0d+1d" : "geometry: cylinder"
+"Table/LegB/+7d+1d/+0d+5d/+0d+1d" : "geometry: cylinder"
+"Table/LegC/+0d+1d/+0d+5d/+7d+1d" : "geometry: cylinder"
+"Table/LegD/+7d+1d/+0d+5d/+7d+1d" : "geometry: cylinder"
+```
+
+## Spatial content cards
+
+Spatial transaction memos can still contain ordinary declaration properties such as `geometry: sphere; color: blue`. If a memo is not valid property text, the transaction importer treats it as a placed spatial content card instead:
+
+- Plain text becomes a paper/card mesh inscribed with the memo text.
+- Plain `http` or `https` URLs become a 2D HTML card in the 3D scene.
+
+Internally these content memos are normalized to explicit spatial declaration properties:
+
+```txt
+"+0d+4d/+0d+2d/+0d+1d" : "content-kind: text; content-text-uri: Hello%20world"
+"+5d+4d/+0d+3d/+0d+10m" : "content-kind: url; content-url-uri: https%3A%2F%2Fexample.com"
+```
+
+Manual spatial declarations can use `content-text`/`content-url` for simple values, or the URI-encoded `content-text-uri`/`content-url-uri` properties when values may contain semicolons, quotes, newlines, or other XYZDSL delimiters. URL content is limited to absolute `http` and `https` URLs and is embedded in a sandboxed iframe; some sites may block iframe embedding, in which case the card still shows an external "Open URL" link.
+
+Primitive dimensions are derived from the bounding box and use the same project-unit scale as paths (`1` = `1 m`, `1d` = `1 dm`, `1c` = `1 cm`, `1m` = `1 mm`). For example, a cone or cylinder uses X/Z as its footprint and Y as its height. Non-square footprints are rendered as scaled elliptical primitives so every primitive fills the declared bounding box. `box-radius` applies only to box geometry and is measured in project units; omitted or zero radius renders a sharp box, and the renderer clamps positive radii to half of the smallest box dimension. `puff` is intentionally a geometry modifier, not a material setting, because it changes the rendered cushion shape.
+
+GLB models can be imported with an absolute HTTP(S) URL or a relative filename. Relative declarations use the default runtime model store at `https://pub-70e24999b560412a8cf712bd468e82c2.r2.dev/`. An explicitly supplied scene asset base takes precedence; absolute URLs keep their own host. Models default to `model-fit: contain` and `model-align: center`; `stretch` and `floor` are also supported. The declared box remains authoritative for layout, selection, collision, and room sizing. For example: `"+1+4/+2+4/+2+4" : "model: https://example.com/modern_chair.glb; model-fit: contain; model-align: floor; rotation: 5,10,5"`. Imported cameras, lights, and animations are not enabled. Static models can be cut by primitive CSG tools, including compressed/quantized model tiers (attributes are decoded on an instance-owned copy before cutting); imported models cannot be CSG tools. The model host must allow browser CORS requests.
+
+## Automatic model variants
+
+For example, `model: side_shelves.glb` loads `https://pub-70e24999b560412a8cf712bd468e82c2.r2.dev/side_shelves.standard.glb`, with inferred siblings `side_shelves.preview.glb` and `side_shelves.detail.glb` in the same store. Unqualified filenames such as `side_shelves.glb` resolve to the `.standard.glb` sibling. Explicit `.standard.glb`, `.preview.glb`, and `.detail.glb` filenames are preserved; explicit `model-preview` and `model-detail` URLs are used exactly as declared. The runtime base is defined by `DEFAULT_MODEL_ASSET_BASE` in `src/model/resolveModelUrl.ts`; the preprocessor's optional web base only controls generated example URLs.
+
+Only `model` is required. The renderer automatically tries preview and detail GLB files in the same directory, using these filename conventions:
+
+| Declared `model` | Inferred `model-preview` | Inferred `model-detail` |
+| --- | --- | --- |
+| `chair.glb` | `chair.preview.glb` | `chair.detail.glb` |
+| `chair.standard.glb` | `chair.preview.glb` | `chair.detail.glb` |
+
+For example, this declaration discovers variants beside the declared URL as the model's visibility tier changes:
+
+```txt
+"Chair/+0+1/+0+1/+0+1" : "model: https://example.com/models/chair.standard.glb; model-align: floor"
+```
+
+The resolved `model` is the base asset; the resolver does not generate variant files. The `.standard.glb`, `.preview.glb`, and `.detail.glb` names match the output of `npm run assets:prepare`. URL query strings and fragments are preserved when deriving sibling URLs.
+
+Explicit `model-preview` and `model-detail` declarations override automatic lookup
+independently. Inherited variants take precedence; overriding `model` clears them
+so siblings are inferred from the replacement source. Normal devices use textured
+detail, falling back to the original if it is unavailable. Previews require
+critical device capability evidence. Asset failures leave other models usable.
+
+Selection and sufficiently large visible models can request original GLBs within
+the runtime memory allowance. Loaded detail remains visible during an upgrade or
+if that upgrade is denied. Displayed originals remain protected while visible;
+cold offscreen originals can be released under pressure after eight seconds.
+Original upgrades are bounded, including on iPhones; selection does not bypass
+the memory checks.
+
+The scene and navigation render immediately. Individual GLBs load in the background
+and appear independently after their own GPU preparation. A slow or failed model
+does not cover the scene; failed assets have a nonblocking retry notice. Downloads
+can overlap within a shared memory allowance, while decoding stays serialized.
+
+See [the model performance guide](docs/performance/README.md) for asset preparation and streaming details.
+
+## Material declaration reference
+
+Spatial primitives intentionally expose only the basic scalar properties needed by the standard metallic/roughness shading model. Material presets, semantic material families, textures, transparency, and extended physical-material properties are not supported.
+
+| Property | Purpose | Range / examples |
+| --- | --- | --- |
+| `color` | Base surface color | `blue`, `white`, `0x3366ff` |
+| `metalness` | Nonmetal-to-metal surface response | `0..1` |
+| `roughness` | Smooth-to-rough surface response | `0..1` |
+
+`metalness` and `roughness` reject nonnumeric values and values outside `0..1`. The default primitive material is a neutral nonmetal with `color: #64748b`, `metalness: 0`, and `roughness: 0.7`. These properties inherit through namespace declarations and `ref` like other object defaults.
+
+```txt
+"Table/" : "color: white; metalness: 0.8; roughness: 0.2"
+"Table/Top/+0d+8d/+4d+1d/+0d+8d" : ""
+"Table/Leg/+0d+1d/+0d+5d/+0d+1d" : "geometry: cylinder; roughness: 0.35"
+"CopiedTable/+10d+8d/+0d+5d/+0d+8d" : "ref: Table/"
+```
+
+See [docs/implementation-plan.md](docs/implementation-plan.md) for architecture details and the feature roadmap.
+
+Rendering quality is automatic; there is no viewer quality selector or saved user override. XYZDSL authors supply model variants with `model`, `model-preview`, and `model-detail` (or inferred siblings). The renderer chooses visibility tiers within device limits and caps pixel density for constrained devices. This keeps scene content in XYZDSL while adapting rendering cost to the device.
+
+## Consolidated internals
+
+Explorer owns the XYZDSL parser, spatial model, renderer, defaults, settings,
+asset lifecycle, and object inspector. See [SPECIFICATION.md](SPECIFICATION.md)
+for the supported language and runtime behavior. Run `npm ci`, `npm test`, and
+`npm run build` in this directory; no standalone viewer checkout is required.
+
+The explorer application retains transaction editing and continuous transform
+controls. Its initial scene lives in `src/defaultDraft.xyzdsl`; remote asset
+configuration lives in `src/scene/remoteModelUrl.ts`. The native prototype imports
+shared source exports from `xyz-explorer` via `file:../explorer`.
+
+### Local scene assets
+
+In editor mode, open **Assets → Open scene folder** to load a folder containing
+one `scene.xyz` and its GLB files. Relative model paths resolve inside that folder;
+files stay in browser memory. Local folder mode leaves transaction overlays out
+of the scene and prevents incoming transactions from replacing the local source.
+**Use remote model store** keeps the edited source and returns model loading to
+the configured remote store. **Reset to remote** also exits local folder mode.
+Missing models appear as errors while the source and Assets controls stay editable.
+
+### Integrated XYZ bundles
+
+**Assets → Open XYZ bundle** opens a self-contained `.xyz` archive without
+extracting it. Version 1 uses an uncompressed ZIP (STORE), with `scene.xyz` at
+the root and GLB files at the relative paths declared by that scene. Include
+prepared `.preview.glb`, `.standard.glb`, and `.detail.glb` siblings when available.
+Model files must embed their textures and buffers. Plain-text declarations still
+belong in the Source editor or in `scene.xyz` inside a selected folder.
+
+The loader reads the archive directory and creates model URLs from file slices,
+so opening a large bundle does not require decompressing all models into JavaScript
+memory. ZIP64, encryption, and compressed ZIP entries are not supported by v1.
+Local bundles use the same source editing, error display, resource cleanup, and
+remote-store switching as scene folders.
+
+## Rooms with box-shell
+
+`box-shell` replaces the name `box-surface`; the old shorthand and face
+properties remain supported aliases. Gallery documents and the default local
+draft use `box-shell`, and saved gallery sources migrate on load.
+
+Create six inward-extending boundary panels with one declaration:
+
+```xyzdsl
+"Room/+10d+366c/+10d+330c/+10d+391c":"box-shell: 1d white;"
+```
+
+This gives the room 10 cm thick white walls, a ceiling, and a floor, within its
+3.66 × 3.30 × 3.91 metre outer box. The clear interior is
+3.46 × 3.10 × 3.71 metres. Children start at the interior wall surfaces and do not
+inherit the shell rule. References retain it; `box-shell: none` cancels it.
+Thickness uses existing path units. With the default outside sizing, opposing
+panels must leave a positive clear interior; inside sizing adds panels around
+the declared clear dimensions. Generated panels support transforms, materials, repetition, collision,
+and shadows. Selecting a panel selects the enclosure's source declaration.
+Primitive CSG tools can cut overlapping panels; model/content/light combinations
+on the enclosure declaration remain unsupported. See the [box-shell specification](SPECIFICATION.md#box-shells) for
+scaling, validation, and generation limits.
+
+### Individual panels and cutaway views
+
+Surface and observability shorthands accept 1, 2, 3, or 6 comma-separated values:
+all faces; top/bottom and walls; top/bottom, right/left, and front/back;
+or top, right, bottom, left, front, back respectively. Override a single face
+with `box-shell-<face>` or `observable-<face>`, in declaration order.
+
+```xyzdsl
+"Sal/+10d+366c/+10d+330c/+10d+391c":"box-shell: 1d white; box-shell-bottom: 2d gray; observable-top: true;"
+```
+
+This room has a thicker gray floor and a ceiling you can see through from above.
+`box-shell-top: none` removes the ceiling instead. `observable: true` makes
+all panels see-through from outside; add `observable-bottom: false` to keep the
+floor visible. These enclosure settings do not affect ordinary children.
+Explicit `observable: +y` still applies +Y separately to every panel; use the
+face-specific form to target only the ceiling. Ordinary boxes retain their
+existing visibility behavior. See [per-face rules](SPECIFICATION.md#per-face-surface-and-observability-properties).
+
+### Placing furniture inside an enclosure
+
+Child offsets start at the inside corner (left wall, floor, front wall):
+
+```xyzdsl
+"Sal/+10d+366c/+10d+330c/+10d+391c":"box-shell: 1d white;"
+"Sal/Bed/+0+155c/+0+8d/+0+205c":"model: salouis/wooden_bed.glb"
+```
+
+The bed's target box starts 10 cm inside each near boundary; its size is unchanged.
+Fill, far-edge alignment, and repetition use the clear interior dimensions.
+Omitted panels have zero thickness. Existing offsets that manually included
+wall thickness should remove that allowance. See the
+[interior coordinate rules](SPECIFICATION.md#interior-coordinates-for-enclosure-children).
+
+### Cutting openings in enclosure panels
+
+Place a primitive `operation: subtraction` tool after the enclosure and across
+its wall thickness. A corner tool cuts all overlapping panels of the selected
+enclosure. Panel materials and observability are retained. Intersection also
+operates per overlapping panel; union adds to one selected panel to avoid
+copying the added solid. See [CSG enclosure rules](SPECIFICATION.md#csg-tools-overlapping-enclosure-panels)
+for a window example and target-selection behavior.
+
+
+## One tiling declaration for all walls
+
+```xyzdsl
+"Sal/+10d+366c/+10d+330c/+10d+391c":"box-shell: 1d white; observable: true;"
+"Sal/Tiling/+0+85c/+0+86c/+0+2c":"surface: walls; model: salouis/tile_triad.glb; reset-axes: 90,0,0; repeat: x; repeat-gap: 1m; repeat-edge: clip;"
+```
+
+`surface: walls` attaches the same component to four interior walls. Coordinates
+are across/up/depth into the room; face rotation and alignment are automatic.
+Use `surface: front,back`, a single face, or `all` for other selections. Repetition
+and clipping work in each face's axes. Attachments follow wall cutaway visibility.
+
+Primitive CSG tools can cut repeated primitives and static GLB tiles. A cut
+selected on an enclosure or its attachments affects overlapping wall panels and
+tiles together. Source assets are not modified. Skinned/instanced/morph meshes
+are excluded, and per-instance processing limits apply. See the
+[surface attachment specification](SPECIFICATION.md#surface-attached-components)
+for coordinate bases, repetition groups, and imported-model CSG limitations.
+
+
+In viewpoint tours, `observable` cutaways are disabled: walls, CSG results, and
+attached tiling stay visible from both sides. Orbit mode restores the authored
+cutaways. Removed panels and CSG openings remain open in both modes.
+
+### Grid partitions inside an enclosure
+
+```xyzdsl
+"Cabinet/+0+12d/+0+18d/+0+4d":"box-shell: 2c white; box-shell-front: none; box-grid: 3 4 2; box-partition: 1c gray;"
+"Cabinet/Item/+0+20c/+0+25c/+0+15c":"cell: 2 3 1; model: item.glb;"
+"Cabinet/Lining/+0+10c/+0+10c/+0+1m":"cell: all; surface: walls; model: tile.glb; repeat: x,y; repeat-edge: clip;"
+```
+
+`box-grid` specifies **columns, rows, slices** along local X, Y, Z. Counts are
+positive integers, measured left-to-right, bottom-to-top, front-to-back.
+`box-partition` supplies the positive thickness and color of shared internal
+dividers; outer faces retain their `box-shell` settings. The count longhands
+are `box-grid-columns`, `box-grid-rows`, and `box-grid-slices`.
+
+`cell: 2 3 1` uses one-based indices and places the child's origin at that cell's
+clear interior corner. `cell: all` copies the child subtree into every cell.
+Fill, far-edge placement, repetition, and `surface` attachments use the cell's
+clear dimensions. Children without `cell` keep the enclosure-relative layout.
+Dividers stay visible even when outer panels are observable; CSG cuts shared
+dividers and overlapping finishes without changing the logical cell layout.
+No internal junction faces are generated. Grids and copies share the document's
+10,000 generation budget. Individual divider overrides are not supported. See
+[grid rules](SPECIFICATION.md#grid-partitions).
+
+
+### Unequal and L-shaped room layouts
+
+Track longhands also accept fixed clear lengths and fractional weights, such as
+`box-grid-columns: 30c 1fr 2fr`. `box-grid-areas` merges repeated names and removes
+dot cells. Columns are separated by spaces, rows by `|`, and slices by `/`.
+Each named area must be a rectangular cuboid.
+
+```xyzdsl
+"Rooms/+0+366c/+0+330c/+0+622c":"box-shell: 1d #fffdd0; box-partition: 1d #fffdd0; box-grid-columns: 140c 196c; box-grid-slices: 371c 221c; box-grid-areas: bedroom bedroom / . annex; observable: true;"
+"Rooms/Bed/+1356m+155c/+0+8d/+1d+205c":"cell: bedroom; model: salouis/wooden_bed.glb;"
+"Rooms/Tiling/+0+85c/+0+86c/+0+2c":"cell: bedroom; surface: walls; model: salouis/tile_triad.glb; reset-axes: 90,0,0; repeat: x; repeat-gap: 1m; repeat-edge: clip;"
+```
+
+This makes one L-shaped enclosure: a merged full-width bedroom in front, an
+annex at the back-right, and no rear-left floor or ceiling. Shared boundaries
+remain single walls. Cell coordinates begin inside the walls; `cell: all`
+visits each merged area once. See [unequal tracks and migration](SPECIFICATION.md#unequal-tracks-omissions-and-merged-areas)
+for exact dimensions, fractional sizing, omission rules, and the full tiling example.
+
+The complete [bedroom and annex scene](docs/examples/bedroom-grid.xyzdsl) migrates
+the furniture, lighting, viewpoints, tiling, and openings to one gridded enclosure.
+
+## UI languages
+
+The web UI defaults to French. The globe menu in the top-right corner switches
+between Français and English without reloading the scene or clearing editor work.
+The choice is saved per browser/origin in `localStorage` under `xyzdsl-language`
+and synchronizes across open tabs. If storage is unavailable, switching still
+works for the current session. Missing or unsupported preferences use French.
+
+UI messages are maintained in `src/i18n/fr.ts` with English source text as keys.
+Components displaying translations subscribe with `useLocale()` and render with
+`t(message, values)`. Keep document titles, authored content, identifiers, XYZDSL
+syntax, and raw parser/server diagnostics intact; translate presentation labels
+rather than protocol or editor values.
+
+
+### Shell origin and inside dimensions
+
+Use `box-shell-origin: outside` on a shell to measure ordinary children from
+its outer corner. Their fill, far-edge alignment, and repetition use the outer
+box too. The default is `inside`; `surface` attachments and `cell` placements
+always keep their selected interior frames.
+
+Use `box-shell-sizing: inside` to declare clear interior dimensions. A room
+specified as 366 × 330 × 391 cm with 10 cm panels then measures
+386 × 350 × 411 cm outside. Its declared position stays at the outer corner.
+The default is `outside`. Both properties can be combined:
+
+```xyzdsl
+"Room/+0+366c/+0+330c/+0+391c":"box-shell: 1d white; box-shell-sizing: inside; box-shell-origin: outside;"
+```
+
+See [shell sizing and child origin](SPECIFICATION.md#shell-sizing-and-child-origin)
+for references, omitted faces, and parent-relative placement rules.
+
+
+An individual child can override the parent policy with `self-origin`:
+
+```xyzdsl
+"Room/+0+4/+0+3/+0+4":"box-shell: 1d white;"
+"Room/Inside/+0+1/+0+1/+0+1":"self-origin: inside; model: item.glb;"
+"Room/Outside/+0+1/+0+1/+0+1":"self-origin: outside; model: item.glb;"
+```
+
+`self-origin: auto` (the default) follows `box-shell-origin` and can reset an
+inherited reference override. The selected frame also governs fill, far-edge
+alignment, and repetition. Explicit overrides require a parent shell and cannot
+combine with `cell` or `surface` placement. See [per-child origin overrides](SPECIFICATION.md#per-child-origin-overrides).
+
+
+## Visibility lighting override
+
+The sun toggle beside the language menu restores the original viewer lighting:
+white ambient intensity 0.45, hemisphere sky `#fff7e8` / ground `#586070` at 0.85,
+and a directional light at `[1, 1.6, 0.9]` with intensity 2.1. This visibility
+rig casts no shadows, matching the original renderer's disabled-shadow behavior.
+It intentionally lights enclosed interiors as well as exterior surfaces.
+
+The override is off on page load; normal viewing keeps ambient intensity 0.12
+and the document's explicit lights. Turning it on retains document lights and
+their shadow budget. The choice survives document/gallery navigation in the
+current page session, resets on reload, and never changes XYZDSL or saved files.
+The native viewer exposes the same shared toggle in its viewport.
+
+### Remote texture sets
+
+`texture: materials/wood.png` automatically requests `materials/wood.map.png`,
+`materials/wood.normal.png`, `materials/wood.roughness.png`, and
+`materials/wood.metalness.png`. The unsuffixed file need not exist. Short paths
+resolve under `VITE_MODEL_ASSET_BASE`, using the same default R2 store as GLBs;
+absolute HTTP(S) image URLs use their own host. PNG, JPEG and WebP are supported.
+All siblings use the declared extension; query strings are preserved (signed
+URLs must authorize each sibling). A source already ending in a map suffix also
+resolves the complete set.
+
+```text
+"Wood/" : "texture: materials/wood.png"
+"Wood/+0+3/+0+0.1/+0+3" : "roughness: 0.8"
+```
+
+Texture declarations inherit through namespaces and references. Maps apply to
+primitives and primitive CSG using existing geometry UVs; they do not override
+GLB materials. Color maps use sRGB; other maps use non-color data. Roughness reads
+green and metalness reads blue. Loaded roughness/metalness maps default their
+scalar multipliers to 1; explicit scalar properties still multiply them. Textured
+surfaces default to white tint. Missing maps retain scalar material fallbacks and
+log a diagnostic in the browser console. Normal maps use the tangent-space +Y
+convention. Repeat controls and per-map overrides are not yet provided.
+
+Concurrent users share cached textures; the last release disposes them, including
+loads that finish after their surfaces have been removed. Browser hosting must
+permit cross-origin image loading. The desktop viewer uses its asset proxy with
+a 32 MiB transfer limit per image.
+
+### Bundled local textures
+
+Use `texture: local:oak` for the built-in oak set, available without R2 in both
+Explorer and the desktop viewer. Source maps, provenance and the catalog live in
+[`src/textures`](src/textures/README.md). Add future sets there using the documented
+four-file naming convention. Remote texture paths keep resolving to the configured
+store.

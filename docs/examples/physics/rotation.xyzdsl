@@ -1,0 +1,5 @@
+"Experiment/+0+3/+0+2/+0+2" : "gravity: 0,0,0"
+"Experiment/Centered/+50c+40c/+1+40c/+20c+40c" : "body: rigid; mass: 2; color: orange"
+"Experiment/Offset/+50c+40c/+1+40c/+120c+40c" : "body: rigid; mass: 2; color: cyan"
+"Experiment/+Centered" : "action: force; vector: 2,0,0; point: center; duration: 1"
+"Experiment/+Offset/+70c/+140c/+140c" : "action: force; vector: 2,0,0; duration: 1"

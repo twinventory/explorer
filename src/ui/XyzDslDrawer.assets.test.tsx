@@ -1,0 +1,55 @@
+// @vitest-environment jsdom
+import { beforeEach as beforeLocaleTest } from 'vitest';
+import { setLocale } from '../i18n';
+// These existing interaction assertions explicitly exercise the English UI.
+beforeLocaleTest(() => setLocale('en'));
+import type { ComponentProps } from 'react';
+import { cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { afterEach, expect, it, vi } from 'vitest';
+import { createSpatialDocument } from '../model/createSpatialDocument';
+import { XyzDslDrawer } from './XyzDslDrawer';
+afterEach(() => { cleanup(); localStorage.clear(); });
+it('makes assets reachable alongside the explorer object and data tabs', () => {
+  const props: ComponentProps<typeof XyzDslDrawer> = {
+    appMode: 'editor', isOpen: true, document: createSpatialDocument(''),
+    transactionPublicKey: '', transactionRange: { startHeight: 0, endHeight: 0, limit: 500 },
+    transactionsLoading: false, tipLoading: false, transactionCount: 0, acceptedTransactionCount: 0,
+    mappedTransactionSource: '', hasRemoteBaseline: false, hasAuthoringEdits: false,
+    remoteBaselineChanged: false, authoringChangeSummary: { added: 0, removed: 0 },
+    source: '', rejectedTransactions: [], secondaryTenants: [],
+    selectionPath: [], selectedNodeCanEdit: false, linearStepChoice: 'auto', rotationStep: 1,
+    onChange: vi.fn(),
+    onModeChange: vi.fn(),
+    onResetToRemote: vi.fn(),
+    onTransactionPublicKeyChange: vi.fn(),
+    onTransactionRangeChange: vi.fn(),
+    onReloadTransactions: vi.fn(),
+    onUseTransactionTip: vi.fn(),
+    onSecondaryReplay: vi.fn(),
+    onSecondaryPlaybackToggle: vi.fn(),
+    onSecondaryPlaybackSpeedChange: vi.fn(),
+    onSecondaryPlaybackSeek: vi.fn(),
+    onLoadSecondaryHistory: vi.fn(),
+    onSecondaryEnabledChange: vi.fn(),
+    onSecondaryRangeChange: vi.fn(),
+    onClearSelection: vi.fn(),
+    onMoveNode: vi.fn(),
+    onResizeNode: vi.fn(),
+    onRotateNode: vi.fn(),
+    onPathNodeSelect: vi.fn(),
+    onNodePropertyChange: vi.fn(),
+    onLinearStepChoiceChange: vi.fn(),
+    onRotationStepChange: vi.fn(),
+    assetsPanel: <p>Folder controls</p>,
+  };
+  const view = render(<XyzDslDrawer {...props} />);
+  fireEvent.click(screen.getByRole('tab', { name: 'Assets' }));
+  expect(screen.getByText('Folder controls')).toBeTruthy();
+  expect(screen.getByRole('tab', { name: 'Objects' })).toBeTruthy();
+  expect(screen.getByRole('tab', { name: 'Data' })).toBeTruthy();
+  view.rerender(<XyzDslDrawer {...props} sourceOpenRequest={1} />);
+  expect(screen.getByRole('tab', { name: 'Source' }).getAttribute('aria-selected')).toBe('true');
+  fireEvent.click(screen.getByRole('tab', { name: 'Objects' }));
+  view.rerender(<XyzDslDrawer {...props} sourceOpenRequest={2} />);
+  expect(screen.getByRole('tab', { name: 'Source' }).getAttribute('aria-selected')).toBe('true');
+});

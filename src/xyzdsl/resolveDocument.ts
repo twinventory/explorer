@@ -1,0 +1,732 @@
+import { parseGridProperties, type GridLayout } from './boxGrid';
+import { parseBoxSurfaceDeclaration } from './boxSurfaceParser';
+import { resolveLayout } from './resolveLayout';
+import type {
+  XyzDslBoxSpec,
+  XyzDslContentSpec,
+  XyzDslGeometrySpec,
+  XyzDslMaterialSpec,
+  XyzDslTransformSpec,
+  XyzDslModelSpec,
+  ParseDiagnostic,
+  SpatialObject,
+} from './types';
+import { canonicalNamespacePath } from './pathParser';
+
+export interface ResolvedSpatialObject extends SpatialObject {
+  gridLayout?: GridLayout;
+  partitionGrid?: GridLayout;
+  cellBoundaryPanels?: Partial<Record<import('./types').SurfaceFace, string>>;
+  cellIndices?: [number, number, number];
+  cellBoundarySegments?: Partial<Record<import('./types').SurfaceFace, { panelId: string; clips: { axis: import('./types').AxisName; extent: number; start?: number }[] }[]>>;
+  cellFrame?: boolean;
+  gridOwnerId?: string;
+  box: XyzDslBoxSpec;
+  material: XyzDslMaterialSpec;
+  geometry: XyzDslGeometrySpec;
+  transform: XyzDslTransformSpec;
+  content: XyzDslContentSpec;
+  model: XyzDslModelSpec;
+  namespacePath: string;
+  parentNamespacePath: string;
+  renderable: boolean;
+  surfaceSourceId?: string;
+  attachedPanelId?: string;
+  attachmentEnclosureId?: string;
+  attachmentFrame?: boolean;
+  repeatGroupId?: string;
+  surfaceFace?: string;
+  layoutEligible?: boolean;
+  materializedFrom?: string;
+  anchorScale?: [number, number, number];
+  /** Physical outer template dimensions, before reference scaling. */
+  referenceDimensions?: [number, number, number];
+  repeatClip?: { axis: import('./types').AxisName; extent: number; start?: number }[];
+  repeatSourceId?: string;
+  repeatIndices?: [number, number, number];
+}
+
+interface ResolvedProperties {
+  material: XyzDslMaterialSpec;
+  geometry: XyzDslGeometrySpec;
+  transform: XyzDslTransformSpec;
+  content: XyzDslContentSpec;
+  model: XyzDslModelSpec;
+}
+
+const DEFAULT_PROPERTIES: ResolvedProperties = {
+  material: { diagnostics: [] },
+  geometry: { kind: 'box', diagnostics: [] },
+  transform: { rotation: [0, 0, 0], diagnostics: [] },
+  content: { diagnostics: [] },
+  model: { fit: 'contain', align: 'center', diagnostics: [] },
+};
+
+function mergeGeometry(
+  base: XyzDslGeometrySpec,
+  override: XyzDslGeometrySpec,
+): XyzDslGeometrySpec {
+  if (!override.declared) {
+    return { ...base, diagnostics: [] };
+  }
+
+  const kind = override.kindDeclared ? override.kind : base.kind;
+
+  return {
+    diagnostics: [],
+    declared: true,
+    ...(override.kindDeclared
+      ? { kindDeclared: true }
+      : { kindDeclared: base.kindDeclared }),
+    kind,
+    ...(kind === 'box'
+      ? {
+          'box-radius': override['box-radius'] ?? base['box-radius'],
+          puff: override.puff ?? base.puff,
+        }
+      : {}),
+    operation: override.operation ?? base.operation,
+    deformation: override.deformation ?? base.deformation,
+  };
+}
+
+function mergeContent(base: XyzDslContentSpec, override: XyzDslContentSpec): XyzDslContentSpec {
+  if (!override.kind) {
+    return { ...base, diagnostics: [] };
+  }
+
+  return { ...override, diagnostics: [] };
+}
+
+function mergeModel(base: XyzDslModelSpec, override: XyzDslModelSpec): XyzDslModelSpec {
+  if (!override.declared) return { ...base, diagnostics: [] };
+
+  return {
+    source: override.sourceDeclared ? override.source : base.source,
+    previewSource: override.previewSource ?? (override.sourceDeclared ? undefined : base.previewSource),
+    detailSource: override.detailSource ?? (override.sourceDeclared ? undefined : base.detailSource),
+    fit: override.fitDeclared ? override.fit : base.fit,
+    align: override.alignDeclared ? override.align : base.align,
+    reorientation: override.reorientationDeclared ? override.reorientation : base.reorientation,
+    reorientationDeclared: override.reorientationDeclared ?? base.reorientationDeclared,
+    declared: true,
+    sourceDeclared: override.sourceDeclared ?? base.sourceDeclared,
+    fitDeclared: override.fitDeclared ?? base.fitDeclared,
+    alignDeclared: override.alignDeclared ?? base.alignDeclared,
+    diagnostics: [],
+  };
+}
+
+function anonymousCompoundRefNamespace(
+  objectIndex: number,
+  occupiedNamespaces: Set<string>,
+): string[] {
+  let suffix = objectIndex + 1;
+
+  while (
+    [...occupiedNamespaces].some((namespacePath) =>
+      namespacePath.startsWith(canonicalNamespacePath([`Ref${suffix}`])),
+    )
+  ) {
+    suffix += 1;
+  }
+
+  const namespace = [`Ref${suffix}`];
+  occupiedNamespaces.add(canonicalNamespacePath(namespace));
+
+  return namespace;
+}
+
+function mergeProperties(
+  base: ResolvedProperties,
+  override: SpatialObject | ResolvedProperties,
+  options: { includeTransform?: boolean } = {},
+): ResolvedProperties {
+  const overrideMaterial = override.material;
+  const overrideGeometry = override.geometry;
+  const overrideTransform = override.transform;
+  const includeTransform = options.includeTransform ?? true;
+
+  return {
+    material: {
+      diagnostics: [],
+      texture: overrideMaterial.texture ?? base.material.texture,
+      color: overrideMaterial.color ?? base.material.color,
+      metalness: overrideMaterial.metalness ?? base.material.metalness,
+      roughness: overrideMaterial.roughness ?? base.material.roughness,
+      observable: overrideMaterial.observable ?? base.material.observable,
+    },
+    geometry: mergeGeometry(base.geometry, overrideGeometry),
+    content: mergeContent(base.content, override.content),
+    model: mergeModel(base.model, override.model),
+    transform:
+      includeTransform && overrideTransform.declared
+        ? { ...overrideTransform, diagnostics: [] }
+        : { ...base.transform, diagnostics: [] },
+  };
+}
+
+function namespacePrefixes(namespace: string[]): string[] {
+  return namespace.map((_, index) =>
+    canonicalNamespacePath(namespace.slice(0, index + 1)),
+  );
+}
+
+function latestNamedEntries(objects: SpatialObject[]): SpatialObject[] {
+  const latestByNamespaceAndKind = new Map<string, SpatialObject>();
+
+  objects.forEach((object) => {
+    if (object.namespace.length > 0) {
+      latestByNamespaceAndKind.set(
+        `${object.declarationOnly ? 'declaration' : 'instance'}:${canonicalNamespacePath(object.namespace)}`,
+        object,
+      );
+    }
+  });
+
+  return objects.filter(
+    (object) =>
+      object.namespace.length === 0 ||
+      latestByNamespaceAndKind.get(
+        `${object.declarationOnly ? 'declaration' : 'instance'}:${canonicalNamespacePath(object.namespace)}`,
+      ) === object,
+  );
+}
+
+function latestEntryBefore(
+  objects: SpatialObject[],
+  namespacePath: string,
+  lineNumber: number,
+  predicate: (candidate: SpatialObject) => boolean = () => true,
+): SpatialObject | undefined {
+  for (let index = objects.length - 1; index >= 0; index -= 1) {
+    const candidate = objects[index];
+    if (
+      candidate.lineNumber < lineNumber &&
+      candidate.namespace.length > 0 &&
+      canonicalNamespacePath(candidate.namespace) === namespacePath &&
+      predicate(candidate)
+    ) {
+      return candidate;
+    }
+  }
+
+  return undefined;
+}
+
+function resolvePropertiesFor(
+  object: SpatialObject,
+  sourceObjects: SpatialObject[],
+  visitedRefTargets: SpatialObject[] = [],
+): { properties: ResolvedProperties; diagnostics: ParseDiagnostic[] } {
+  let properties = { ...DEFAULT_PROPERTIES };
+  const diagnostics: ParseDiagnostic[] = [];
+
+  const fullNamespacePath = canonicalNamespacePath(object.namespace);
+
+  namespacePrefixes(object.namespace).forEach((prefix) => {
+    const declaration =
+      prefix === fullNamespacePath && object.declarationOnly
+        ? undefined
+        : latestEntryBefore(
+            sourceObjects,
+            prefix,
+            object.lineNumber,
+            (candidate) => candidate.declarationOnly,
+          );
+    if (declaration) {
+      properties = mergeProperties(properties, prefix === fullNamespacePath ? declaration : { ...declaration, geometry: { ...declaration.geometry, deformation: undefined } });
+    }
+
+    if (prefix !== fullNamespacePath) {
+      const ancestor = latestEntryBefore(
+        sourceObjects,
+        prefix,
+        object.lineNumber + 1,
+        (candidate) => !candidate.declarationOnly,
+      );
+      if (ancestor && ancestor !== object) {
+        properties = mergeProperties(properties, { ...ancestor, geometry: { ...ancestor.geometry, deformation: undefined } }, {
+          includeTransform: false,
+        });
+      }
+    }
+  });
+
+  if (object.reference.targetPath) {
+    const targetPath = object.reference.targetPath;
+
+    const target = latestEntryBefore(
+      sourceObjects,
+      targetPath,
+      object.lineNumber,
+    );
+
+    if (!target) {
+      diagnostics.push({
+        line: object.lineNumber,
+        source: object.source,
+        message: `Reference target "${targetPath}" was not found.`,
+      });
+    } else if (visitedRefTargets.includes(target)) {
+      diagnostics.push({
+        line: object.lineNumber,
+        source: object.source,
+        message: `Cyclic ref detected: ${[
+          ...visitedRefTargets.map((entry) =>
+            canonicalNamespacePath(entry.namespace),
+          ),
+          targetPath,
+        ].join(' -> ')}`,
+      });
+    } else {
+      const resolvedTarget = resolvePropertiesFor(
+        target,
+        sourceObjects,
+        [...visitedRefTargets, target],
+      );
+      diagnostics.push(...resolvedTarget.diagnostics);
+      properties = mergeProperties(properties, resolvedTarget.properties);
+    }
+  }
+
+  properties = mergeProperties(properties, object);
+
+  return { properties, diagnostics };
+}
+
+function namespaceStartsWith(namespace: string[], prefix: string[]): boolean {
+  return prefix.every((segment, index) => namespace[index] === segment);
+}
+
+function hasConcreteAncestorInstance(
+  object: SpatialObject,
+  concreteNamespaces: Set<string>,
+): boolean {
+  if (object.namespace.length <= 1) {
+    return true;
+  }
+
+  for (let length = object.namespace.length - 1; length > 0; length -= 1) {
+    if (
+      concreteNamespaces.has(
+        canonicalNamespacePath(object.namespace.slice(0, length)),
+      )
+    ) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function concreteNamespaceSet(objects: SpatialObject[]): Set<string> {
+  const concreteNamespaces = new Set<string>();
+
+  objects
+    .filter(
+      (object) =>
+        !object.declarationOnly && object.box && object.namespace.length <= 1,
+    )
+    .forEach((object) =>
+      concreteNamespaces.add(canonicalNamespacePath(object.namespace)),
+    );
+
+  let changed = true;
+  while (changed) {
+    changed = false;
+
+    objects.forEach((object) => {
+      if (
+        object.declarationOnly ||
+        !object.box ||
+        object.namespace.length === 0
+      ) {
+        return;
+      }
+
+      const key = canonicalNamespacePath(object.namespace);
+      if (
+        !concreteNamespaces.has(key) &&
+        hasConcreteAncestorInstance(object, concreteNamespaces)
+      ) {
+        concreteNamespaces.add(key);
+        changed = true;
+      }
+    });
+  }
+
+  return concreteNamespaces;
+}
+
+function hasMaterializedChildInstance(
+  object: ResolvedSpatialObject,
+  instances: ResolvedSpatialObject[],
+): boolean {
+  if (object.namespace.length === 0) {
+    return false;
+  }
+
+  return instances.some(
+    (candidate) =>
+      candidate !== object &&
+      candidate.namespace.length > object.namespace.length &&
+      object.namespace.every(
+        (segment, index) => candidate.namespace[index] === segment,
+      ),
+  );
+}
+
+function mergeResolvedProperties(
+  base: ResolvedProperties,
+  override: ResolvedProperties,
+): ResolvedProperties {
+  return mergeProperties(base, override);
+}
+
+function dimensionsFromBox(box: XyzDslBoxSpec): [number, number, number] {
+  return [box.width, box.height, box.depth];
+}
+
+function dimensionsFromRootChildren(
+  descendants: SpatialObject[],
+  targetNamespace: string[],
+): [number, number, number] | undefined {
+  const rootChildren = descendants.filter(
+    (descendant) => descendant.namespace.length === targetNamespace.length + 1,
+  );
+  const boxes = (rootChildren.length > 0 ? rootChildren : descendants)
+    .map((descendant) => descendant.box)
+    .filter(Boolean) as XyzDslBoxSpec[];
+
+  if (boxes.length === 0) {
+    return undefined;
+  }
+
+  const minX = Math.min(...boxes.map((box) => box.x));
+  const minY = Math.min(...boxes.map((box) => box.y));
+  const minZ = Math.min(...boxes.map((box) => box.z));
+  const maxX = Math.max(...boxes.map((box) => box.x + box.width));
+  const maxY = Math.max(...boxes.map((box) => box.y + box.height));
+  const maxZ = Math.max(...boxes.map((box) => box.z + box.depth));
+
+  return [maxX - minX, maxY - minY, maxZ - minZ];
+}
+
+function scaleToFit(
+  sourceDimensions: [number, number, number] | undefined,
+  targetBox: XyzDslBoxSpec,
+): [number, number, number] | undefined {
+  if (
+    !sourceDimensions ||
+    sourceDimensions.some((dimension) => dimension <= 0)
+  ) {
+    return undefined;
+  }
+
+  return [
+    targetBox.width / sourceDimensions[0],
+    targetBox.height / sourceDimensions[1],
+    targetBox.depth / sourceDimensions[2],
+  ];
+}
+
+export function resolveXyzDslDocument(objects: SpatialObject[]): {
+  objects: ResolvedSpatialObject[];
+  diagnostics: ParseDiagnostic[];
+} {
+  const diagnostics: ParseDiagnostic[] = [];
+  objects = objects.filter(object => !object.path.actionTarget && !object.physics?.action);
+  const surfaces = new Map<SpatialObject, SpatialObject['boxSurface']>();
+  const surfaceFor = (object: SpatialObject): SpatialObject['boxSurface'] => {
+    if (surfaces.has(object)) return surfaces.get(object);
+    const target = object.reference.targetPath ? latestEntryBefore(objects, object.reference.targetPath, object.lineNumber) : undefined;
+    const messages: string[] = [];
+    const surface = parseBoxSurfaceDeclaration(object.surfaceDeclarations ?? [], messages, target ? surfaceFor(target) : object.boxSurface);
+    if (object.declarationOnly && surface) {
+      surface.invalid = true;
+      messages.push('box-shell requires a concrete box declaration.');
+    }
+    diagnostics.push(...messages.map(message => ({ line: object.lineNumber, source: object.source, message })));
+    surfaces.set(object, surface);
+    return surface;
+  };
+  const grids = new Map<SpatialObject, ReturnType<typeof parseGridProperties>>();
+  const gridFor = (object: SpatialObject): ReturnType<typeof parseGridProperties> => {
+    if (grids.has(object)) return grids.get(object)!;
+    const target = object.reference.targetPath ? latestEntryBefore(objects, object.reference.targetPath, object.lineNumber) : undefined;
+    const messages: string[] = [];
+    const grid = parseGridProperties(object.gridDeclarations ?? [], messages, target ? gridFor(target) : object);
+    if (object.declarationOnly && (grid.boxGrid || grid.cell)) {
+      if (grid.boxGrid) grid.boxGrid = { ...grid.boxGrid, invalid: true };
+      if (grid.cell) grid.cell = { ...grid.cell, invalid: true };
+      messages.push('box-grid and cell require concrete declarations.');
+    }
+    diagnostics.push(...messages.map(message => ({ line: object.lineNumber, source: object.source, message })));
+    grids.set(object, grid);
+    return grid;
+  };
+  const selfOrigins = new Map<SpatialObject, SpatialObject['selfOrigin']>();
+  const selfOriginFor = (object: SpatialObject): SpatialObject['selfOrigin'] => {
+    if (selfOrigins.has(object)) return selfOrigins.get(object);
+    const target = object.reference.targetPath ? latestEntryBefore(objects, object.reference.targetPath, object.lineNumber) : undefined;
+    let value = object.selfOrigin ?? (target ? selfOriginFor(target) : undefined);
+    if (object.declarationOnly && value !== undefined && value !== 'auto') {
+      value = 'invalid';
+      diagnostics.push({ line: object.lineNumber, source: object.source, message: 'self-origin requires a concrete box declaration.' });
+    }
+    selfOrigins.set(object, value);
+    return value;
+  };
+  objects = objects.map(object => {
+    const selfOrigin = selfOriginFor(object);
+    const grid = gridFor(object);
+    const boxSurface = surfaceFor(object);
+    let attachmentSource = object;
+    while (!attachmentSource.surface && attachmentSource.reference.targetPath) {
+      const target = latestEntryBefore(objects, attachmentSource.reference.targetPath, attachmentSource.lineNumber);
+      if (!target) break;
+      attachmentSource = target;
+    }
+    object = { ...object, surface: attachmentSource.surface };
+    if (object.declarationOnly && object.surface) diagnostics.push({ line: object.lineNumber, source: object.source, message: 'surface requires a concrete declaration.' });
+    return { ...object, ...grid, selfOrigin, boxSurface, material: boxSurface ? { ...object.material, observable: undefined } : object.material };
+  });
+  const effectiveObjects = latestNamedEntries(objects);
+  const instances = effectiveObjects.filter(
+    (object) => !object.declarationOnly && object.box,
+  );
+  const concreteNamespaces = concreteNamespaceSet(effectiveObjects);
+
+  const resolveObject = (
+    object: SpatialObject,
+    index: number,
+    options: {
+      materializedFrom?: string;
+      namespace?: string[];
+      idPrefix?: string;
+    } = {},
+  ): ResolvedSpatialObject => {
+    const { properties, diagnostics: propertyDiagnostics } =
+      resolvePropertiesFor(object, objects);
+    diagnostics.push(...propertyDiagnostics);
+    if (properties.model.declared && !properties.model.source) {
+      diagnostics.push({
+        line: object.lineNumber,
+        source: object.source,
+        message: 'Model options require an effective model declaration.',
+      });
+    }
+
+    const namespace = options.namespace ?? object.namespace;
+    const namespacePath = canonicalNamespacePath(namespace);
+    const parentNamespacePath = canonicalNamespacePath(namespace.slice(0, -1));
+    const duplicateSuffix = namespace.length > 0 ? `#${index + 1}` : '';
+    const idPath =
+      namespace.length > 0
+        ? `${namespacePath}${object.box!.source}${duplicateSuffix}`
+        : object.id;
+
+    return {
+      ...object,
+      boxSurface: object.boxSurface,
+      namespace,
+      id: options.idPrefix ? `${options.idPrefix}${idPath}` : idPath,
+      box: object.box!,
+      namespacePath,
+      parentNamespacePath,
+      renderable: false,
+      material: properties.material,
+      geometry: properties.geometry,
+      transform: properties.transform,
+      content: properties.content,
+      model: properties.model,
+      materializedFrom: options.materializedFrom,
+    };
+  };
+
+  const resolvedObjects = instances.map((object, index) =>
+    resolveObject(object, index),
+  );
+  const originalByObject = new Map<SpatialObject, ResolvedSpatialObject>();
+  instances.forEach((object, index) =>
+    originalByObject.set(object, resolvedObjects[index]),
+  );
+  const materializedObjects: ResolvedSpatialObject[] = [];
+  const anchorScaleById = new Map<string, [number, number, number]>();
+  const occupiedNamespaces = new Set(
+    objects
+      .map((object) => canonicalNamespacePath(object.namespace))
+      .filter(Boolean),
+  );
+
+  resolvedObjects.forEach((object, objectIndex) => {
+    if (
+      !object.reference.targetPath ||
+      !hasConcreteAncestorInstance(object, concreteNamespaces)
+    ) {
+      return;
+    }
+
+    const targetNamespace = object.reference.targetPath
+      .split('/')
+      .filter(Boolean);
+    const historicalEntries = latestNamedEntries(
+      objects.filter((candidate) => candidate.lineNumber < object.lineNumber),
+    );
+    const descendants = historicalEntries.filter(
+      (candidate) =>
+        !candidate.declarationOnly &&
+        candidate.box &&
+        candidate !== object &&
+        candidate.namespace.length > targetNamespace.length &&
+        namespaceStartsWith(candidate.namespace, targetNamespace),
+    );
+    if (object.boxSurface) {
+      // Earlier shell references may have materialized children without authored
+      // declarations under their instance name. Retain those when copying again.
+      const authoredPaths = new Set(descendants.map(d => canonicalNamespacePath(d.namespace)));
+      descendants.push(...materializedObjects.filter(candidate =>
+        candidate.namespace.length > targetNamespace.length &&
+        namespaceStartsWith(candidate.namespace, targetNamespace) &&
+        !authoredPaths.has(candidate.namespacePath)));
+    }
+    const isCompoundReference = descendants.length > 0;
+    const instanceNamespace =
+      isCompoundReference && object.namespace.length === 0
+        ? anonymousCompoundRefNamespace(objectIndex, occupiedNamespaces)
+        : object.namespace;
+
+    if (isCompoundReference && object.namespace.length === 0) {
+      object.namespace = instanceNamespace;
+      object.namespacePath = canonicalNamespacePath(instanceNamespace);
+      object.parentNamespacePath = canonicalNamespacePath(
+        instanceNamespace.slice(0, -1),
+      );
+    }
+
+    const target = latestEntryBefore(
+      objects,
+      object.reference.targetPath,
+      object.lineNumber,
+    );
+    if (object.reference.scale && (isCompoundReference || object.boxSurface)) {
+      // A scaled shell reference retains its original local geometry; chained copies
+      // scale that same frame instead of treating the previous path size as unscaled.
+      let dimensionTarget = target;
+      if (object.boxSurface) while (dimensionTarget?.reference.scale && dimensionTarget.reference.targetPath) {
+        const previous = latestEntryBefore(objects, dimensionTarget.reference.targetPath, dimensionTarget.lineNumber);
+        if (!previous?.boxSurface || !previous.box) break;
+        dimensionTarget = previous;
+      }
+      object.referenceDimensions = dimensionTarget?.box
+        ? dimensionsFromBox(dimensionTarget.box)
+        : dimensionsFromRootChildren(descendants, targetNamespace);
+      if (object.referenceDimensions && dimensionTarget?.boxSurface?.sizing === 'inside') {
+        const near = ['left', 'bottom', 'front'] as const, far = ['right', 'top', 'back'] as const;
+        object.referenceDimensions = object.referenceDimensions.map((n, a) => n + (dimensionTarget!.boxSurface!.faces[near[a]]?.thickness ?? 0) + (dimensionTarget!.boxSurface!.faces[far[a]]?.thickness ?? 0)) as [number, number, number];
+      }
+      if (!object.referenceDimensions) object.referenceDimensions = [NaN, NaN, NaN];
+    }
+    const anchorScale = object.reference.scale
+      ? scaleToFit(
+          target?.box
+            ? dimensionsFromBox(target.box)
+            : dimensionsFromRootChildren(descendants, targetNamespace),
+          object.box,
+        )
+      : undefined;
+
+    if (anchorScale) {
+      anchorScaleById.set(object.id, anchorScale);
+    }
+
+    descendants.forEach((descendant, descendantIndex) => {
+      const resolvedDescendant =
+        originalByObject.get(descendant) ??
+        (materializedObjects.includes(descendant as ResolvedSpatialObject) ? descendant as ResolvedSpatialObject : resolveObject(descendant, descendantIndex));
+      const suffix = descendant.namespace.slice(targetNamespace.length);
+      const namespace = [...instanceNamespace, ...suffix];
+      const properties = mergeResolvedProperties(
+        {
+          material: object.material,
+          geometry: { ...object.geometry, deformation: undefined },
+          transform: object.transform,
+          content: object.content,
+          model: object.model,
+        },
+        {
+          material: resolvedDescendant.material,
+          geometry: resolvedDescendant.geometry,
+          transform: resolvedDescendant.transform,
+          content: resolvedDescendant.content,
+          model: resolvedDescendant.model,
+        },
+      );
+
+      materializedObjects.push({
+        ...resolvedDescendant,
+        id: `${object.id}->${resolvedDescendant.namespacePath}${resolvedDescendant.box.source}#${objectIndex + 1}-${descendantIndex + 1}`,
+        namespace,
+        namespacePath: canonicalNamespacePath(namespace),
+        parentNamespacePath: canonicalNamespacePath(namespace.slice(0, -1)),
+        material: properties.material,
+        geometry: properties.geometry,
+        transform: properties.transform,
+        content: properties.content,
+        model: properties.model,
+        reference: { diagnostics: [] },
+        materializedFrom: object.reference.targetPath,
+        renderable: false,
+      });
+    });
+  });
+
+  const allObjects = [...resolvedObjects, ...materializedObjects];
+  const materializedConcreteNamespaces = new Set(concreteNamespaces);
+  materializedObjects.forEach((object) =>
+    materializedConcreteNamespaces.add(object.namespacePath),
+  );
+
+  const renderEligibleObjects = allObjects.filter(
+    (object) =>
+      object.materializedFrom ||
+      hasConcreteAncestorInstance(object, materializedConcreteNamespaces),
+  );
+  const referencedTargetNamespaces = new Set(
+    effectiveObjects
+      .map((object) => object.reference.targetPath)
+      .filter(Boolean) as string[],
+  );
+
+  allObjects.forEach((object) => {
+    const belongsToReferencedTemplate = [...referencedTargetNamespaces].some(
+      (targetPath) => object.namespacePath.startsWith(targetPath),
+    );
+
+    if (
+      object.namespace.length > 1 &&
+      !belongsToReferencedTemplate &&
+      !renderEligibleObjects.includes(object) &&
+      !hasConcreteAncestorInstance(object, materializedConcreteNamespaces)
+    ) {
+      diagnostics.push({
+        line: object.lineNumber,
+        source: object.source,
+        message: `Nested declaration "${object.namespacePath}${object.box.source}" has no concrete ancestor namespace anchor and will not render. Declare "${canonicalNamespacePath(object.namespace.slice(0, 1))}" as a concrete instance to materialize its local children.`,
+      });
+    }
+  });
+
+  return {
+    objects: resolveLayout(allObjects.map((object) => ({
+      ...object,
+      anchorScale: anchorScaleById.get(object.id) ?? object.anchorScale,
+      layoutEligible: renderEligibleObjects.includes(object),
+      renderable:
+        renderEligibleObjects.includes(object) &&
+        !hasMaterializedChildInstance(object, renderEligibleObjects),
+    })), diagnostics, referencedTargetNamespaces),
+    diagnostics,
+  };
+}

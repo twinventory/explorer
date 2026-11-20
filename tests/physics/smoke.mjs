@@ -1,0 +1,31 @@
+import { chromium } from '@playwright/test';
+import { readFile } from 'node:fs/promises';
+const source = await readFile(new URL('../../docs/examples/physics/rotation.xyzdsl', import.meta.url), 'utf8');
+const browser = await chromium.launch({ channel: 'chrome', headless: true });
+try {
+ const page = await browser.newPage({ viewport: { width: 1200, height: 800 } });
+ const errors = [];
+ page.on('pageerror', error => errors.push(error.message));
+ await page.addInitScript(source => localStorage.setItem('xyzdsl-gallery', JSON.stringify([{ id: 'physics', title: 'Force experiments', source }])), source);
+ await page.goto('http://127.0.0.1:5174/');
+ const panel = page.getByRole('region', { name: 'Physics experiment' });
+ await panel.waitFor();
+ await panel.getByRole('button', { name: 'Step', exact: true }).click();
+ await panel.getByText('0.01 s', { exact: true }).waitFor();
+ await panel.getByRole('button', { name: 'Reset', exact: true }).click();
+ await panel.getByText('0.00 s', { exact: true }).waitFor();
+ await panel.getByRole('button', { name: 'Play', exact: true }).click();
+ await page.waitForFunction(() => Number(document.querySelector('[aria-label="Physics experiment"] output')?.textContent?.split(' ')[0]) >= .5);
+ await panel.getByRole('button', { name: 'Pause', exact: true }).click();
+ const paused = await panel.locator('output').textContent();
+ await page.waitForTimeout(100);
+ if (await panel.locator('output').textContent() !== paused) throw Error('Pause did not freeze time');
+ await page.screenshot({ path: '/tmp/xyz-physics-desktop.png' });
+ await page.setViewportSize({ width: 390, height: 844 });
+ await panel.waitFor();
+ const box = await panel.boundingBox();
+ if (!box || box.x < 0 || box.x + box.width > 390) throw Error('Physics controls overflow mobile viewport');
+ await page.screenshot({ path: '/tmp/xyz-physics-mobile.png' });
+ if (errors.length) throw Error(errors.join('\n'));
+ console.log('Browser smoke passed: play, pause, step, reset, desktop/mobile controls, no page errors.');
+} finally { await browser.close(); }

@@ -1,0 +1,1217 @@
+# XYZDSL specification and runtime
+
+Explorer is the primary application and owns this executable specification.
+The parser and regression tests define supported syntax; the historical
+`xyz-dsl-spec` playground is not a second production implementation.
+
+## Default local draft and camera precision
+
+The bundled local draft (`src/defaultDraft.xyzdsl`) opens the Pap room with a
+600 mm tile grid, 1 mm joints, and clipped edge tiles. The flooring container
+starts at Y = 660 mm; the lounge rug declaration starts at Y = 196 mm.
+
+Selecting a thin model must not reduce depth precision across the room. In the
+editor, the camera near plane adapts to the distance from the selected bounds,
+allowing close inspection while avoiding surface flicker from farther away.
+Tours use the overall scene scale regardless of the editor selection. These
+camera settings are automatic and require no additional DSL properties.
+
+## Parent fill and repetition
+
+Paths retain three explicit X/Y/Z axis segments. Each axis is
+`+offset+size`, with either value optional. An omitted offset with a fixed size means **align to the parent’s far edge**;
+an omitted size means **fill the remaining parent extent from that offset**.
+The shorthand uses only existing Base64 path characters.
+
+| Segment | Meaning |
+| --- | --- |
+| `+2d+1` | Start at 20 cm; size 1 metre |
+| `++1` | Size 1 metre; start at parent size minus 1 metre |
+| `+2d+` | Start at 20 cm; extend to the parent's far edge |
+| `+0+` or `++` | Fill the entire parent axis |
+
+```text
+"Wall/+0+5/+0+3/+0+2d" : ""
+"Wall/Rail/++/+1+1d/+0+2d" : "color: brown"
+"Wall/Slat/+0+1d/++/+0+2d" : "repeat: x; repeat-gap: 1d"
+```
+
+The rail is 5 metres wide. There are 25 slats, each 10 cm wide and
+3 metres tall, with 10 cm gaps. The final 10 cm of wall width remains empty.
+`++size` resolves its offset as `parentSize - size`, in the parent's local
+axis before rotation. It requires a concrete parent with a finite positive
+extent and rejects sizes larger than that extent. `++` remains the special
+case of zero offset and full parent size; `+0+size` explicitly starts at zero.
+Repetition proceeds forward from the resolved offset, so far-edge alignment
+produces one copy on that axis; backward repetition is not implied.
+
+No `expand` property is needed: the omitted axis size expresses expansion.
+Coordinate and gap units are metres without a suffix, decimetres (`d`),
+centimetres (`c`), or millimetres (`m`).
+
+`repeat` accepts distinct comma-separated axes: `x`, `y`, `z`, or combinations
+such as `x,z`. `repeat-gap` is one nonnegative length used on every repeated
+axis; it defaults to zero and requires `repeat`. Repetition preserves the
+original offset and size. The default `repeat-edge: whole` includes only complete
+copies that fit and leaves any remainder at the far edge. If no whole copy fits,
+it produces no objects. Multiple axes form a grid.
+An axis cannot simultaneously fill and repeat.
+
+### Clipped edge tiles
+
+Use `repeat-edge: clip` to cover the remainder with part of an additional tile:
+
+```text
+"Flooring/+2+109d/+66c+1c/+1d+397c":"color: white"
+"Flooring/Tiling/+0+6d/+0+6d/+0+6d":"model: lepapayer/floor_tiling.glb; rotation: 90,0,0; repeat: x,z; repeat-gap: 1m; repeat-edge: clip"
+```
+
+This 10.9 × 3.97 metre floor generates 19 columns and 7 rows. Tiles retain their
+600 mm sizing and 1 mm joints. The final visible column is 82 mm wide and the
+final row is 364 mm deep; the corner is clipped on both axes. `repeat-edge`
+accepts only `whole` (default) or `clip`, and requires `repeat`.
+
+Clip mode includes every copy whose starting edge is strictly inside the parent:
+`max(0, ceil((P - o) / (s + g)))`, with round-off tolerance at exact boundaries.
+It preserves gaps: if the remaining space lies entirely in a gap, no sliver is
+added. There is no stretching or redistribution. A tile larger than its parent
+can still contribute its visible portion.
+
+Clipping uses the parent's local boundaries **only on the repeated axes**, and
+follows parent rotations and reference scaling. In the example, the 1 cm parent
+height does not clip the tiles in Y. Nested subtrees retain ancestor clipping
+boundaries and may introduce additional ones. Tile boxes, transforms, model
+fitting, and UVs remain unchanged; the renderer clips visible geometry and
+shadows. Imported materials are cloned per instance without modifying the
+shared model asset. Shader clipping does not add solid caps across cut faces.
+
+Selection rays and tour collision ignore the cropped portions (including
+triangles crossing an edge). Selection/overlap bounds intersect the clipping
+region, while retaining the existing conservative world-AABB approximation.
+Primitive CSG operands are clipped before boolean evaluation. Static imported
+models can be CSG targets as described under surface attachments below. Content cards, including HTML overlays, are not supported
+inside clipped subtrees and are omitted with a diagnostic.
+
+For parent length `P`, offset `o`, size `s`, and gap `g`, fill resolves to
+`P - o`. Whole-edge repetition produces `max(0, floor((P - o + g) / (s + g)))` copies,
+positioned at `o + i * (s + g)`; exact-fit comparisons allow floating point
+round-off. Filling requires strictly positive remaining space.
+
+The parent is the nearest **concrete namespace ancestor**, skipping
+namespace-only declarations. Layout runs top-down in the parent's local axes,
+before rotations, world transforms, collision bounds, and CSG. Rotated geometry
+may extend beyond the parent's box: these rules size unrotated layout boxes,
+unless `repeat-edge: clip` explicitly clips the repeated axes. A container's
+filled box does not automatically stretch its children; children can declare
+their own filled axes.
+
+Repetition copies the entire subtree. Child layout is evaluated within each
+copy, and nested repetition is supported. Repeat properties apply locally to
+the concrete declaration, not as inherited namespace defaults. Children copied
+from a reference template retain their own repeat rules. A reference instance
+can itself repeat. Without `ref-scale`, template children fill the instance's
+box. With `ref-scale: true`, layout accounts for the template-to-instance scale
+so dimensions are scaled exactly once. Scaled templates need definite positive
+source dimensions: give the template a fixed concrete anchor if its children
+use fill sizing. Inferring a size from children that themselves need that size
+is diagnosed rather than treated as a circular constraint.
+
+Missing parents, invalid gaps/axes, incompatible fill/repeat rules, and
+nonpositive fill extents produce diagnostics and omit the affected subtree.
+Unanchored reference-template children are evaluated when materialized into an
+instance. Generation is limited to 10,000 instances per repetition and 10,000
+generated nodes per document (including descendants). Exceeding the document
+budget omits the containing root subtree and reports a diagnostic.
+
+Generated copies have unique, deterministic internal identities; their source
+text and line number still identify the authored declaration. Editing a copy
+therefore edits the source shared by all copies. Moving a filled axis preserves
+its fill rule. Size nudges on filled axes leave the rule intact; enter an explicit
+size in the source to switch that axis back to fixed sizing.
+
+Position nudges preserve far-edge alignment; enter an explicit offset in the
+source to move freely. Size nudges change the fixed size while retaining alignment.
+
+For compiler consumers, `parseAxisSpec` returns `offset: 'end'` for `++size`
+and `size: 'fill'` for omitted sizes. Parsed boxes carry `endAxes` with unresolved
+(`NaN`) offsets; layout resolves these and removes `endAxes`.
+Parsed boxes carry `fillAxes`; their corresponding numeric dimensions are
+unresolved (`NaN`). Use `resolveXyzDslDocument` or `createSpatialDocument` before
+consuming dimensions for geometry. Resolved boxes have finite dimensions and no
+`fillAxes`. Generated nodes expose `repeatSourceId` and `repeatIndices` in their
+metadata, alongside the original `lineNumber`.
+
+## Shared core
+
+Tours and ordinary navigation share the same model-quality policy. Normal devices
+keep an explicit `model-detail` asset or inferred `<stem>.detail.glb` as a stable
+textured baseline. Missing details fall back to originals, subject to constrained
+device memory checks. The runtime does not select `.standard` variants.
+Previews require critical capability evidence: RAM ≤1 GiB, or RAM ≤2 GiB together
+with ≤2 logical CPU cores. An iPhone, mobile viewport, or missing memory hint
+alone never selects previews.
+
+The former center/outer quality rings and two-second focus/downgrade timers no
+longer apply. Nearby visible models covering at least 400 CSS pixels can request
+originals after required baselines are decoded. Other devices also prefetch within
+a 1.75× guard frustum; constrained devices request only models actually in view.
+Visible requests outrank guard-only requests.
+
+A displayed original remains protected while visible, including when another
+model loads or its screen size shrinks. Under memory pressure, an original may
+be released after eight continuous seconds outside the view and guard region,
+or fully concealed by a verified solid wall. Returning before that interval
+completes cancels release. The textured baseline stays resident. Inferred
+simplification over 32× retains an original once granted; this fidelity guard
+does not override admission limits.
+
+Original upgrades have bounded residency. iOS, RAM ≤4 GiB, and unavailable memory
+hints use a 160 MiB original allowance and 256 MiB combined model estimate.
+Other devices allow 1,024 MiB of originals / 1,536 MiB combined. GLB metadata is
+checked before optional decode and GPU upload; constrained required-model
+fallbacks receive these checks too. These estimates are not actual process RAM
+caps. Denied upgrades keep textured detail; oversized required scenes remain
+covered by a preparation/error screen. The supplied bed detail has a known UV
+defect that remains when its original cannot safely be admitted.
+
+Refresh/unmount cancels pending work and disposes late results before GPU upload.
+Context loss pauses loading; recovery retries interrupted work. Shader preparation
+is cancellable. Decode work is serialized, shared instances retain resources
+through leases, and demand rendering stops at rest. Removed baselines expire
+after five seconds or sooner under pressure/new loading; released originals
+have no additional cache grace.
+
+The former `TourModelFocus` implementation is not used by `ModelPrimitive`.
+Current policy lives in `src/scene/ModelPrimitive.tsx`,
+`src/performance/ModelRuntime.tsx`, and `src/performance/modelUpgradeMemory.ts`.
+See `docs/performance/README.md` for validation procedures and limitations.
+
+`xyz-explorer` exports the parser, spatial model, renderer, asset resolver,
+and editor components for TypeScript-aware consumers. The native prototype
+uses `SpatialScene` with its own asset transport. Explorer configures its remote
+store in `src/scene/remoteModelUrl.ts`, including `VITE_MODEL_ASSET_BASE` overrides.
+
+## Explorer workspace
+
+Explorer retains its object tree, selected-object inspector, source editor,
+transaction panels, and responsive workspace. Transform buttons support holding
+Enter or Space and pointer presses for continuous modification. Step choices,
+direct numeric editing, and scene keyboard controls remain available.
+
+The initial scene is `src/defaultDraft.xyzdsl`. Rendering preferences and camera
+settings live in `src/scene/CoreSceneRoot.tsx` and retain their persistence keys.
+The reusable `VisualEditor` and `openLocalScene` APIs remain available to hosts;
+Explorer uses its own transaction-aware `App` and `XyzDslDrawer`.
+
+## Primary specification implementation
+
+Explorer owns the executable parser, resolution rules, spatial model, renderer,
+settings, defaults, and regression tests. Implement language changes in `src/xyzdsl`
+and `src/model`, rendering changes in `src/scene`, and run `npm test` and `npm run build`.
+The native prototype consumes these sources through the `xyz-explorer` package.
+
+
+## Lights and enclosed interiors
+
+Declare an invisible point emitter using the same spatial paths as view points:
+
+```xyz
+"lamp/+2+1c/+2+1c/+2+1c" : "light-source: true; light-color: #fff0d0; light-intensity: 10; light-distance: 0"
+```
+
+`light-source` accepts `true` or `point`; `false` leaves an ordinary object.
+The box center sets the source position, including parent transforms. Its size
+is an authoring handle, not a glowing mesh. In orbital editor mode, light
+sources show an orange bounding box (yellow when selected), with the same
+Cmd/Ctrl-click selection as view points. These helpers are hidden in viewing
+and tour modes. Light settings are explicit on the
+source declaration (not inherited namespace styles). Intensity defaults to 10
+candelas; distance defaults to 0 (no cutoff), in metres. Both must be finite and
+non-negative; intensity 0 disables illumination. Color defaults to white and
+uses the existing material color syntax. Lights are excluded from solid geometry,
+CSG, and collision. Referenced subtree lights retain their transformed positions.
+
+All three viewers share shadow rendering. No directional or point lights are
+created by default. A subtle white ambient fill (intensity 0.12) is present
+everywhere, including sealed interiors, and casts no shadows. Scenes remain
+dimly visible without explicit light sources; point lights add local illumination
+and shadows. Point shadows use a scene-fitted distance range and small depth/normal
+offsets, capped by declared solid dimensions, to reduce self-shadow striping.
+Shadow maps use 2048 pixels per cube face; this costs four times the shadow-map
+pixels of the previous 1024 setting. Hardware texture limits can reduce the
+actual resolution. Thin imported mesh details and CSG shell thickness are not
+fully represented by authoring bounds, so extreme scenes can still require tuning.
+Imported models cast and receive shadows. Their camera-independent baseline
+stays loaded off camera to preserve occlusion; original-fidelity upgrades follow
+the shared memory policy. Shadow passes and retained baselines cost GPU time
+and memory; each point source renders six
+shadow views. Imported emissive/unlit materials, HTML content, missing assets,
+coarse preview geometry and finite shadow-map precision can still affect the
+appearance of lighting. Ambient fill is a visibility aid, not simulated indirect
+light bounces.
+
+Regression coverage includes `src/scene/Lighting.test.ts` and a GPU enclosure
+check in the sibling explorer: run `npm run test:performance -- lighting.spec.ts`
+from `explorer` with Chrome installed. The GPU test checks sealed panel and CSG
+rooms for dim ambient visibility without an interior light, and brighter
+illumination when an interior light is added.
+
+## One-way observability for blocks and surfaces
+
+`observable` names the **local side from which you can see through** a primitive
+block. From the opposite side it renders normally. For example:
+
+```xyzdsl
+"Surface/+1+2/+1+2/+1+2" : "observable: true; color: gray"
+"Wall/+0+4/+0+3/+0+1c" : "observable: +z; color: gray"
+```
+
+Accepted values are `+x`, `-x`, `+y`, `-y`, `+z`, `-z`, `true` (alias for `+z`),
+and `false` (ordinary rendering, also the default). Invalid values produce a
+parser diagnostic. `Surface` is an ordinary namespace, not a special geometry.
+Use a thin box for a wall; zero thickness is not required.
+
+The decision uses the camera position relative to the block's center plane.
+For `+z`, a camera on the positive local Z side sees through the entire block;
+a camera on the negative side or exactly on the plane sees the block. This
+works for thick blocks as well as thin walls, and the axis follows the block's
+resolved rotation, including parent transforms. This is a camera-dependent
+cutaway, not glass or a physically simulated one-way mirror.
+
+The property inherits through namespaces and references like other material
+properties; `observable: false` explicitly cancels an inherited setting. It
+applies to built-in primitives and CSG results (using the base block's setting
+and center plane). Imported models and text/URL content currently do not apply
+this property.
+
+Implementation: the parser validates and normalizes the material property,
+the resolver merges it, and `scene/observability.ts` updates mesh visibility
+before rendering and model occlusion checks. On the see-through side the block
+also stops casting shadows and intercepting selection rays. Physical POV
+collision remains active on both sides. Existing scenes without the property
+retain their normal rendering.
+
+## Mobile rendering and local device testing
+
+Point-light shadows share a bounded budget rather than allocating a 2048-face
+atlas for every light. Mobile/touch and known low-memory devices use up to four
+512-face shadows (64 MiB estimated RGBA + depth); desktop uses up to eight
+shadowed lights within 256 MiB, reducing face resolution to fit. Pap's four
+lights therefore use 512 on mobile and 1024 on desktop. Additional lights keep
+illuminating but do not cast shadows. Atlas dimensions also respect the GPU's
+maximum texture size. Shadows at 512 faces or below use a wider PCF filter
+(radius 2) to soften jagged edges without increasing shadow-map allocation.
+Mobile uses the balanced DPR cap of 1.5 with MSAA (critical devices and recovery
+restarts use DPR 1 without MSAA). Original-model upgrades use rendered pixel
+size so high-DPI phone screens do not unfairly remain on prepared detail assets.
+Model fidelity and model admission limits remain separate and unchanged; these
+estimates are not measurements of total browser memory.
+
+WebGL context loss disables shadows and reduces DPR to 1. This fallback persists
+for the tab session (including reloads), and loading/error/restart controls live
+outside the WebGL canvas. Closing the tab clears its session fallback. Static
+shadow caching is not enabled: model streaming, clipping, edits and visibility
+changes continue to update shadows correctly.
+
+To test the bundled Pap scene against local prepared models without depending
+on the remote store, run from this directory:
+
+```sh
+XYZ_LOCAL_MODELS_DIR=/path/to/lepapayer-models \
+VITE_MODEL_ASSET_BASE=http://127.0.0.1:5176/__local-models/ \
+npm run dev -- --host 127.0.0.1 --port 5176 --strictPort
+```
+
+Open `http://127.0.0.1:5176/` in desktop or iOS Simulator Safari. The opt-in fixture
+route serves only named GLB files from the configured directory during dev; it
+is absent from production builds. The source scene is `src/defaultDraft.xyzdsl`.
+`VITE_MODEL_ASSET_BASE` can also configure a hosted asset base at build time.
+
+For a physical phone on the same Wi-Fi, replace `127.0.0.1` in both the host
+and asset-base URL with the computer's LAN address, then open that address and
+port in Safari. This temporarily exposes the development app and fixture models
+to reachable LAN devices; stop the server with Ctrl-C when testing finishes.
+
+Physical iPhone 11 testing of Pap confirmed loading/rendering and subsequent
+improvements to model detail and shadow edges. Patterned striping remains in
+some shadows and is deferred for a future fix. See
+[mobile rendering validation](docs/mobile-rendering-validation.md) for coverage
+and limitations.
+
+For a development-only context-loss test, append `?renderDiagnostics=1` and use
+**Test graphics recovery**. It requests context loss through `WEBGL_lose_context`
+and requests restoration one second later. Confirm the loading UI clears,
+navigation works, and the canvas `data-render-budget` reports `safe: true` and
+zero shadow bytes. Simulated context loss does not validate recovery from an
+OS process kill or prove the cause of the original phone crash.
+
+## Imported model orientation
+
+Use `reset-axes: X, Y, Z` to correct an imported model's orientation
+before bounding-box fitting and alignment. Values are finite angles in degrees,
+using XYZ Euler order, and default to `0, 0, 0`. The correction preserves the
+asset's authored transforms and applies separately to each instance. It inherits
+with model settings; an explicit `0, 0, 0` overrides an inherited correction.
+
+```xyz
+"Pap/BedroomRug/+7141m+165c/+0+1d/+2183m+6d" : "model: lepapayer/bedroom_rug.glb; reset-axes: 90, 0, 0; model-align: floor"
+```
+
+Y is vertical. `model-align: floor` places the corrected model at the bottom of
+its target box. Ordinary `rotation` still rotates the fitted object and its
+alignment offset together; use it for scene placement after reorientation.
+
+<a id="box-surfaces"></a>
+
+## Box shells
+
+`box-shell` is the canonical enclosure property. `box-surface` and its six
+`box-surface-*` face properties remain compatibility aliases for `box-shell`
+and `box-shell-*`. Both spellings resolve in authored declaration order; the
+later property wins, including overrides on references and `none` resets.
+The `surface` attachment property, `observable-*`, and `box-grid-*` names are
+unchanged. Bundled gallery documents and the default local draft use the new
+spelling. Saved gallery sources migrate on load without replacing user content.
+
+`box-shell` creates six ordinary solid box panels inside a concrete box:
+
+```xyzdsl
+"Room/+10d+366c/+10d+330c/+10d+391c":"box-shell: 1d white;"
+```
+
+The simplest syntax is `box-shell: <thickness> <color>`, or `box-shell: none`.
+Face shorthands and overrides are specified below.
+Thickness uses the existing path-length grammar: unpadded integer digits with
+an optional `d`, `c`, or `m` suffix, or metres without a suffix. It must be
+finite and strictly positive. The remaining value uses the existing `color`
+syntax. Repeated properties use the final value. `none` disables a copied
+surface rule and restores ordinary box/container behavior.
+
+By default, declared dimensions describe the outside of the enclosure;
+`box-shell-sizing: inside` instead declares its clear interior. For local
+width W, height H, depth D, and thickness t, panels have these local boxes:
+
+| Panel | Offset (X, Y, Z) | Size (X, Y, Z) |
+| --- | --- | --- |
+| Ceiling | (0, H−t, 0) | (W, t, D) |
+| Floor | (0, 0, 0) | (W, t, D) |
+| Front | (0, 0, 0) | (W, H, t) |
+| Back | (0, 0, D−t) | (W, H, t) |
+| Left | (0, 0, 0) | (t, H, D) |
+| Right | (W−t, 0, 0) | (t, H, D) |
+
+Panels overlap at corners, matching six explicit filled-axis box declarations.
+The room above has a 3.46 × 3.10 × 3.71 metre clear interior. Layout requires
+that the sum of opposing panel thicknesses is smaller than the corresponding
+local dimension (`2t < min(W, H, D)` for uniform panels). Missing panels have
+zero thickness; zero-width interiors are rejected. The parent is a
+non-rendering container, so no solid box fills the interior. Authored children use the enclosure's interior coordinate system, described
+below; generated panels remain anchored to the outside dimensions.
+
+This is a local structural property, not an inherited namespace style. Ordinary
+children do not acquire it. References retain the target's surface rule,
+including rules on copied descendants; a local value overrides the copied rule.
+Namespace-only declarations cannot enable it. The shorthand color overrides
+panel color only; it does not change authored children's material defaults.
+Other material settings come from the container's resolved material. Enclosure
+observability is local to its panels, as specified below.
+
+Panels are generated after parent-relative sizing, in the container's local
+coordinates, before world transforms. Rotations apply once through the parent.
+With `ref-scale: true`, panels and thickness scale with the template axes exactly
+once; nonuniform scaling can produce different world thicknesses on each axis.
+Without reference scaling, thickness remains the declared length. Repetition
+copies the enclosure and its children; `repeat-edge: clip` clips panels through
+the existing ancestor clipping rules.
+
+Generated faces use deterministic internal identities that cannot collide with
+source namespace names such as `Room/Floor`. Their metadata exposes
+`surfaceSourceId` and `surfaceFace`; source text and line number identify the
+authored enclosure. Selecting a face targets its enclosure, and edits change the
+single source declaration. Each generated panel counts against the
+shared 10,000 generated-node document budget, including repeated enclosures.
+Exceeding that budget omits the containing root subtree atomically.
+
+Malformed thickness, invalid resolved dimensions, and unsupported combinations
+produce diagnostics and omit the affected concrete subtree. Version one supports
+plain boxes, ordinary children, materials, transforms, references, and repetition.
+A surface declaration cannot also be an imported model, content card, light,
+viewpoint, non-box/deformed primitive, or CSG operation. Primitive CSG tools can cut generated panels as described below. Existing
+explicit panel declarations retain their behavior.
+
+Panels use the existing primitive rendering, shadow, observability, picking,
+and collision paths. No renderer-specific shell primitive or new asset is needed.
+
+### Per-face surface and observability properties
+
+Face names and six-value order are **top, right, bottom, left, front, back**.
+Top is +Y (ceiling), right +X, bottom −Y (floor), left −X, front −Z,
+and back +Z, in the enclosure's local axes.
+
+Both `box-shell` and enclosure `observable` accept comma-separated values:
+
+| Count | Expansion |
+| --- | --- |
+| 1 | All six faces |
+| 2 | Top/bottom; right/left/front/back |
+| 3 | Top/bottom; right/left; front/back |
+| 6 | Top, right, bottom, left, front, back |
+
+Other counts and empty values are invalid. Commas inside color functions such
+as `rgb(255, 0, 0)` are not separators. Every surface value is a positive path
+length followed by a color, or `none`. Use `box-shell-top`,
+`box-shell-right`, `box-shell-bottom`, `box-shell-left`,
+`box-shell-front`, or `box-shell-back` to override one panel. Each longhand
+accepts exactly one value. `none` on a face omits that panel; a single
+`box-shell: none` disables the enclosure. An enabled enclosure with all faces
+omitted remains a non-rendering container.
+
+```xyzdsl
+"Sal/+10d+366c/+10d+330c/+10d+391c":"box-shell: 1d white; box-shell-top: none; box-shell-bottom: 2d gray;"
+```
+
+Observability has matching `observable-top`, `observable-right`,
+`observable-bottom`, `observable-left`, `observable-front`, and
+`observable-back` longhands. Each value is `true`, `false`, or an explicit signed
+axis. On an enclosure panel, `true` means see-through from that panel's **outside**:
++Y for top, +X for right, −Y for bottom, −X for left, −Z for front, +Z for back.
+The panel remains visible from inside. `false` keeps it visible on both sides.
+Visibility still uses each panel's center plane, follows transforms, suppresses
+shadows and selection rays while hidden, and leaves physical collision active.
+
+```xyzdsl
+"Sal/+10d+366c/+10d+330c/+10d+391c":"box-shell: 1d white; observable-top: true;"
+"Other/+6+4/+1+4/+1+4":"box-shell: 1d white; observable: true; observable-bottom: false;"
+```
+
+The first example hides only the ceiling when viewed from above. The second
+allows exterior views through every panel except its floor. Explicit directions
+retain their meaning: `observable: +y` assigns +Y to every panel and can hide the
+floor and walls at different camera heights. Use `observable-top: true` for a
+ceiling cutaway. Ordinary boxes retain the existing `observable: true` alias
+for +Z.
+
+Shorthands and longhands apply in source declaration order: a later shorthand
+replaces all earlier face values of that property; a later longhand replaces
+only its face. Reference settings are copied before local declarations are
+applied. Surface and enclosure observability settings do not propagate to ordinary
+children, but copied descendants retain their own settings. Face-specific
+properties and multi-value observability require an enabled enclosure, including
+one obtained through a reference. Unsupported combinations or malformed values
+produce diagnostics and omit the affected concrete subtree. Observability on an
+omitted face has no rendering effect.
+
+### Shell sizing and child origin
+
+`box-shell-sizing` and `box-shell-origin` are independent structural properties
+on an enabled shell. Both accept `inside` or `outside`:
+
+| Property | Default | Meaning |
+| --- | --- | --- |
+| `box-shell-sizing` | `outside` | Whether fixed declared dimensions describe the outer box or the clear interior |
+| `box-shell-origin` | `inside` | Whether ordinary children use the clear interior frame or the outer box frame |
+
+```xyzdsl
+"Room/+0+366c/+0+330c/+0+391c":"box-shell: 1d white; box-shell-sizing: inside; box-shell-origin: outside;"
+"Room/Item/+0+155c/+0+8d/+0+205c":"model: item.glb;"
+```
+
+This room has a clear interior of 366 × 330 × 391 cm and outer dimensions of
+386 × 350 × 411 cm. Its item starts at the outer corner `(0, 0, 0)`. With the
+default `box-shell-origin: inside`, the item would start at `(0.1, 0.1, 0.1)`
+metres. `box-shell-origin` changes the children's frame; it does not move the
+shell itself. The shell's declared position remains its **outer near corner**
+with either sizing mode.
+
+For inside sizing, add the actual near and far panel thicknesses to each fixed
+clear dimension. Missing faces add zero; asymmetric thicknesses are supported.
+For outside sizing, subtract those thicknesses to derive the clear interior.
+Both modes require a finite positive clear interior. A shell with inside sizing
+may have panels thicker than its declared clear dimensions.
+
+Ordinary children use the selected frame's origin **and extent**: `+0`, fill,
+far-edge alignment, repetition, and repeat clipping all agree. Outside-origin
+children can occupy the panel volume; no extra clipping or wall avoidance is
+implied. Explicit `surface` attachments and `cell` placements retain their
+face-local and clear-cell frames, regardless of `box-shell-origin`. Grid tracks
+always partition the clear interior.
+
+When a shell itself uses fill, its physical outer size fits the available parent
+frame; inside sizing deducts its own panels to obtain the remaining clear space.
+Far-edge alignment uses the expanded outer size, and repetition uses that outer
+size plus the repeat gap, preventing overlap between repeated shells. Explicit
+fixed inside dimensions are never shrunk to fit a parent.
+
+References retain both settings and may override them in declaration order.
+They are not inherited by ordinary descendants: each nested shell defaults to
+outside sizing and inside origin. With `ref-scale: true`, the reference's sizing
+mode determines whether its target size denotes clear or outer dimensions;
+panels and contents scale together exactly once. For example, a template with
+2 m clear dimensions and 10 cm panels, referenced at 4 m with inside sizing,
+has 20 cm panels and 4.4 m outer dimensions. Referencing it at 4 m with outside
+sizing instead scales its 2.2 m outer box to 4 m.
+
+The `box-shell` panel shorthand does not reset these independent options.
+Options require an enabled shell (including one supplied by a reference);
+invalid values or use without a shell produce diagnostics and omit the affected
+subtree. Existing scenes keep their original sizing and child coordinates.
+
+### Per-child origin overrides
+
+An ordinary child can override its enclosing shell's `box-shell-origin` with
+`self-origin: inside | outside | auto`. `auto` is the default and follows the
+parent shell's setting. This property changes the child's placement frame,
+including available extents for fill, far-edge alignment, repetition, and repeat
+clipping. It does not change the parent's shell geometry or other children.
+
+```xyzdsl
+"Room/+0+4/+0+3/+0+4":"box-shell: 1d white;"
+"Room/Bed/+0+155c/+0+8d/+0+205c":"self-origin: inside; model: bed.glb;"
+"Room/OuterItem/+0+1/+0+1/+0+1":"self-origin: outside; model: item.glb;"
+```
+
+The bed starts at `(0.1, 0.1, 0.1)` metres; `OuterItem` starts at `(0, 0, 0)`.
+An inside override also works when the parent declares
+`box-shell-origin: outside`. Missing and asymmetric panel thicknesses, inside
+sizing, rotations, and reference scaling keep their existing meanings.
+
+`self-origin` is local structural state. References retain it and may override
+it; `self-origin: auto` resets a copied override to the new parent's policy.
+Ordinary descendants do not inherit it. For a child that is itself a shell,
+`self-origin` positions that shell in its parent; its own `box-shell-origin`
+still governs its children independently. Namespace-only groups are skipped
+when identifying the nearest concrete parent.
+
+An explicit `inside` or `outside` override requires a concrete, enabled parent
+shell. It cannot be combined with active `cell` or `surface` placement, which
+already chooses a distinct coordinate frame. These conflicts and malformed
+values produce diagnostics and omit the affected child subtree. `auto` imposes
+no override and is allowed with cell/surface placement or an ordinary parent.
+Unanchored referenced templates are checked when placed in their actual parent.
+
+### Interior coordinates for enclosure children
+
+By default, children of a `box-shell` enclosure start at its interior corner. Local
+`+0` on X, Y, and Z lies on the inside of the left, bottom, and front panels,
+respectively. Missing panels contribute zero inset. The available child-layout
+extent is the outer local size minus the two opposing panel thicknesses.
+
+```xyzdsl
+"Sal/+10d+366c/+10d+330c/+10d+391c":"box-shell: 1d white;"
+"Sal/Bed/+0+155c/+0+8d/+0+205c":"model: salouis/wooden_bed.glb"
+```
+
+Here the bed's target box starts at world (1.1, 1.1, 1.1) metres and retains
+its 1.55 × 0.80 × 2.05 metre dimensions. Model fitting and alignment still use
+that target box. `++` fills the 3.46 × 3.10 × 3.71 metre interior;
+`++size` aligns to the corresponding inside far wall. Explicit offsets are
+measured from the interior origin. Fixed dimensions are not automatically
+clamped or resized to fit inside the room.
+
+Repetition counts and `repeat-edge: clip` use interior boundaries. The inset
+is applied before world rotation and reference scaling, exactly once per concrete
+enclosure ancestor, including through namespace-only groups. Nested enclosures
+introduce their own interior coordinate frames. Ordinary intermediate containers
+keep their usual coordinate rules. Generated panels stay in the exterior frame,
+and hiding a panel with `observable` does not remove its inset; only `none`
+removes a panel. `box-shell: none` restores ordinary container coordinates.
+
+This changes earlier enclosure child layout: existing authored child offsets
+that already included wall thickness should remove that manual allowance.
+Resolved child boxes include the inset; source paths retain authored offsets.
+
+### CSG tools overlapping enclosure panels
+
+Declare a primitive tool after the enclosure using the existing `operation`
+property. Target selection retains the existing rule: nearest earlier overlapping
+primitive, preferring the same namespace scope. If the selected target is an
+enclosure panel, subtraction and intersection apply independently to every
+panel of that same enclosure instance whose world bounds overlap the tool.
+Other enclosures and non-overlapping panels remain unchanged. Intersection is
+therefore a per-panel operation, not intersection of the entire shell.
+
+```xyzdsl
+"Room/+1+4/+1+4/+1+4":"box-shell: 1d white; observable: true"
+"Window/+9d+3d/+2+1/+2+1":"operation: subtraction"
+```
+
+The tool spans X=0.9–1.2 metres, cutting through the left panel at X=1–1.1.
+This example uses a world-space sibling tool because child coordinates begin
+at the room's interior surface. A tool must cross the panel thickness to make
+a through-opening; merely touching its inside boundary is insufficient.
+
+Corner cuts can affect multiple panels. Each result retains its panel material,
+observability, selection owner, and existing CSG rendering/collision behavior.
+Tools are consumed once, and successive operations retain source order.
+Union retains a single selected panel as its base so the added solid is emitted
+only once. Static imported models can also be CSG targets; imported models
+cannot serve as tools. The enclosure declaration itself cannot carry an `operation`. Omitted panels cannot be CSG targets.
+Clipped primitives continue to use the existing operand clipping rules.
+
+
+## Surface-attached components
+
+`surface` attaches a concrete child to the interior faces of its nearest concrete
+`box-shell` parent. It accepts `walls` (left, front, right, back), `all` (all six
+faces), or distinct comma-separated face names. It is local, not inherited by
+ordinary children; references retain it. Namespace-only declarations cannot
+attach. An explicit missing face produces a diagnostic and no copy for that
+face; `walls` and `all` silently skip omitted panels.
+
+```xyzdsl
+"Sal/+10d+366c/+10d+330c/+10d+391c":"box-shell: 1d white; observable: true;"
+"Sal/Tiling/+0+85c/+0+86c/+0+2c":"surface: walls; model: salouis/tile_triad.glb; reset-axes: 90,0,0; repeat: x; repeat-gap: 1m; repeat-edge: clip;"
+```
+
+Attachment coordinates are face-local: X goes across the face, Y goes up the
+face, and positive Z extends from its interior surface into the room. For walls,
+Y is always enclosure +Y. The following basis vectors are in enclosure-local
+axes, and origins are corners of the clear interior:
+
+| Face | Origin | Local X | Local Y | Local Z |
+| --- | --- | --- | --- | --- |
+| front | left/bottom/front | +X | +Y | +Z |
+| back | right/bottom/back | −X | +Y | −Z |
+| left | left/bottom/back | −Z | +Y | +X |
+| right | right/bottom/front | +Z | +Y | −X |
+| top | left/top/front | +X | +Z | −Y |
+| bottom | left/bottom/back | +X | −Z | +Y |
+
+Each copy uses the same source dimensions and offsets. `reset-axes` corrects an
+asset once before fitting, then the face frame places it. Ordinary `rotation`
+is relative to that frame. Fill, far-edge alignment, and repetition operate in
+face axes. Depth fill uses the full clear interior dimension normal to the face.
+`repeat: x` repeats independently across each face; `x,y` forms a grid. Clipping
+uses the face-local repeat boundaries, not world X/Y/Z. There is no automatic
+corner wrapping, pattern centering, corner trimming, or mitering.
+
+An attachment and its descendants follow the owning panel's observability
+using that panel's center plane, including imported model meshes. Hidden
+attachments do not render, cast shadows, or intercept selection rays; physical
+collision remains active. Ordinary furniture is unaffected. CSG results retain
+this behavior. Attachments on removed faces are not generated.
+
+Attachment frames and copies count against the shared generated-node budget.
+Internal identities are deterministic and source line ownership is retained;
+selecting a copy edits its shared authored declaration. Children are copied
+with the attachment. Models and primitives are supported; content cards,
+lights, and viewpoints cannot be directly attached.
+
+### CSG with repetitions and imported targets
+
+A primitive tool with `operation` can target repeated primitives or static
+imported models. Subtraction/intersection fan out to all overlapping instances
+of the selected repetition group; union still emits the added solid only once
+on the selected base. Each repeated cutter is evaluated in source order. Groups
+are scoped to their concrete parent/reference instance, so unrelated copies
+are not accidentally modified. Non-overlapping instances remain unchanged.
+
+When the selected target is an enclosure panel **or a surface attachment**, the
+same tool applies to overlapping panels and attachments of that enclosure.
+This makes one window tool cut both the wall and its tile finish. Ordinary
+furniture is not included in that group. Existing source-order and namespace
+preferences still determine the initial target. Intersection is per overlapping
+piece, not intersection of the entire room or repetition set.
+
+GLB processing happens on instance-owned static meshes after orientation and
+fitting, before display. Quantized and interleaved vertex attributes are decoded
+to floating-point values on the instance copy before world-space transforms
+and boolean evaluation. This prevents compressed asset tiers from losing
+tiles outside the cut. Shared source buffers remain unchanged. Existing UVs,
+vertex colors, tangents, and material groups are retained; newly cut faces use the affected mesh's first
+material and the primitive tool's UVs. Untextured parts without UV attributes
+receive neutral coordinates. Cuts preserve the original target box and fitting
+rather than shrinking and refitting the remaining geometry. Rendered triangle
+picking and collision use the cut geometry; authoring bounds remain conservative.
+The active streamed asset tier is cut independently, so geometric detail may
+change when a higher-quality asset becomes available.
+
+Imported models remain unsupported as CSG *tools*. Skinned, instanced, or
+morph-target meshes are not supported as imported CSG targets. They produce a
+model preparation error rather than silently showing an uncut asset. Work is
+limited to 2,000,000 input triangles × operations per model instance. Primitive
+tools retain their repetition clipping; imported target geometry retains its
+rendering/shadow/raycast clipping. Model union adds the tool solid to the first
+mesh once; it does not merge the asset's original meshes into one solid. Valid,
+closed mesh inputs are recommended; non-manifold or self-intersecting imported
+geometry can produce imperfect boolean results.
+
+
+For example, append this world-space tool after the Sal tiling declaration to
+cut the front wall and overlapping tiles together:
+
+```xyzdsl
+"WindowCut/+2+1/+13d+5d/+9d+4d":"operation: subtraction;"
+```
+
+The tool spans X=2–3, Y=1.3–1.8, Z=0.9–1.3 metres, crossing both the wall and
+the inward tile finish. Keep the cutter after the intended targets. Attached
+components use face coordinates, while this sibling cutter uses world coordinates.
+
+Regression coverage lives in `src/xyzdsl/surfaceAttachment.test.ts` and
+`src/scene/modelCsg.test.ts`, alongside the existing enclosure CSG tests. Checks
+cover orientation, clipping, references, missing faces, repeated cutters,
+shared-asset preservation, material groups, and picking/collision through cuts.
+Run `npm test` and `npm run build` in Explorer, and `npm run build:renderer`
+in the native viewer after shared renderer changes.
+
+
+## Observability in tours
+
+`observable` cutaways apply only outside tour mode. While a viewpoint tour is
+active, primitive panels, CSG results, and surface-attached models remain visible
+from both sides regardless of their observable settings. This also restores
+normal shadow casting, picking, and visual occlusion. Collision remains active
+in either mode. Leaving the tour restores camera-dependent cutaway behavior.
+
+No source edits are required. For adjoining rooms, a wall marked observable
+from the outside therefore stays visible when a tour viewpoint enters the
+neighboring room. CSG openings and explicitly omitted panels remain open;
+tour mode does not reconstruct removed geometry.
+
+## Grid partitions
+
+A concrete `box-shell` enclosure can divide its clear interior into a
+three-dimensional grid with equal or unequal tracks, omitted cells, and merged
+rectangular areas. These are local structural properties, not inherited
+namespace styles. References retain them and can override them in declaration
+order. Ordinary descendants do not acquire a grid or cell selection.
+
+```xyzdsl
+"Cabinet/+0+12d/+0+18d/+0+4d":"box-shell: 2c white; box-shell-front: none; box-grid: 3 4 2; box-partition: 1c gray;"
+"Cabinet/Item/+0+20c/+0+25c/+0+15c":"cell: 2 3 1; model: item.glb;"
+```
+
+| Property | Values | Meaning |
+| --- | --- | --- |
+| `box-grid` | Three positive integer counts, or `none` | Columns (X), rows (Y), slices (Z); `none` clears the grid and partition style |
+| `box-grid-columns` | Positive integer count, or length/`fr` track list | Columns from left to right |
+| `box-grid-rows` | Positive integer count, or length/`fr` track list | Rows from bottom to top |
+| `box-grid-slices` | Positive integer count, or length/`fr` track list | Slices from front to back |
+| `box-partition` | Positive path length followed by color | Uniform internal-divider thickness and color |
+| `box-grid-areas` | Names and dots in a track-shaped map, or `none` | Merge repeated names and omit dot cells; `none` restores separate occupied cells |
+| `cell` | Area name, three positive one-based indices, `all`, or `none` | Place in an area/cell, copy into each occupied logical area, or clear a referenced selection |
+
+Declaring a grid longhand or partition style initializes unspecified counts to
+one. A count of one creates no divider on that axis. A `1 1 1` grid exposes one
+cell without internal geometry and needs no partition style. Any larger grid
+requires an explicit `box-partition`; it never guesses a thickness or color from
+potentially different outer faces. Grid and cell rules require concrete
+objects, including when used in templates. A grid requires an active
+`box-shell` enclosure; cancelling the shell on a reference also requires
+cancelling its grid. Existing plain-box restrictions for `box-shell` apply.
+
+### Clear dimensions and cell layout
+
+Resolve the enclosure and its existing outer-face thicknesses first. On each
+axis with clear interior extent `L`, count `n`, and divider thickness `t`:
+
+```text
+clear cell size = (L - (n - 1) × t) / n
+cell origin = outer near-face thickness + (index - 1) × (clear cell size + t)
+```
+
+Lengths use the enclosure's local coordinates before parent/reference transforms.
+Rotations and `ref-scale` apply once to the shell, dividers, cell frames, and
+children. Each repeated/reference enclosure owns its own grid. Omitted outer
+faces contribute no inset; they do not remove internal partitions.
+
+`cell` resolves against the nearest concrete parent, which must have a grid.
+Namespace-only grouping does not change that parent. Cell frames are internal
+layout anchors with deterministic identities, not authored namespace names.
+For `cell: all`, the child and its descendants are copied once per occupied
+logical area (once per cell without an area map), with
+independent repetition and unique instance IDs. Selecting a copy retains its
+authored source ownership. Children without `cell` retain the existing enclosure
+interior coordinates and may span multiple cells. A child can itself declare
+another gridded enclosure, allowing nested subdivisions.
+
+Within a selected cell, `+0` starts at its clear interior corner. Fill and
+far-edge alignment use the clear cell extent. Repetition and `repeat-edge: clip`
+use cell boundaries. Ordinary explicitly sized children are not automatically
+clamped or clipped to a cell. Descendants use their usual parent coordinates.
+
+### Unequal tracks, omissions, and merged areas
+
+A lone positive integer remains an equal-track count: `box-grid-columns: 3`.
+Use path lengths (`d` decimetres, `c` centimetres, `m` millimetres) or positive
+fractional weights for explicit tracks, for example:
+
+```xyzdsl
+"Shelf/+0+14d/+0+10d/+0+10d":"box-shell: 1d white; box-partition: 1d gray; box-grid-columns: 30c 1fr 2fr;"
+```
+
+Subtract outer panels and all divider widths first, then fixed tracks. Divide
+the remaining space in proportion to the `fr` weights. In this example the clear
+track widths are 30 cm, 23⅓ cm, and 46⅔ cm. A single fixed track needs a metric
+suffix to distinguish it from a count. Fixed-only lists must exactly fill the
+clear extent after dividers (within floating-point tolerance). Tracks do not
+silently stretch, overflow, or leave an unassigned gap.
+
+`box-grid-areas` uses space-separated columns, `|` between rows (bottom to top),
+and `/` between slices (front to back). The map must explicitly cover the whole
+grid. A dot omits a cell; repeated names merge a rectangular cuboid of cells.
+The divider space inside a merge becomes part of its clear interior. Area names
+start with an ASCII letter or underscore and continue with letters, digits,
+underscores, or hyphens. They are case-sensitive; `all` and `none` are reserved
+for selection/reset syntax.
+
+For example, `a b | a c / d e | d f` describes two columns, two rows, and two
+slices. Area `a` spans both rows in the front-left column and `d` spans both rows
+in the back-left column. A repeated name forming an L shape is invalid: use
+separate rectangular areas to describe the occupied L-shaped footprint.
+
+This single enclosure reproduces the bedroom and annex dimensions:
+
+```xyzdsl
+"Rooms/+0+366c/+0+330c/+0+622c":"box-shell: 1d #fffdd0; box-partition: 1d #fffdd0; box-grid-columns: 140c 196c; box-grid-rows: 1; box-grid-slices: 371c 221c; box-grid-areas: bedroom bedroom / . annex; observable: true;"
+"Rooms/Bed/+1356m+155c/+0+8d/+1d+205c":"cell: bedroom; model: salouis/wooden_bed.glb;"
+"Rooms/AnnexLighting/+728m+34c/+2975m+7c/+133c+301m":"cell: annex; light-source: true; light-color: #ffffff; light-intensity: 10; light-distance: 0;"
+"Rooms/WallTiling/+0+85c/+0+86c/+0+2c":"cell: bedroom; surface: walls; model: salouis/tile_triad.glb; reset-axes: 90,0,0; repeat: x; repeat-gap: 1m; repeat-edge: clip;"
+"Rooms/FloorTiling/+0+67c/+0+67c/+0+1c":"cell: bedroom; surface: bottom; model: salouis/tile_quartet.glb; reset-axes: 90,0,0; repeat: x,y; repeat-gap: 1m; repeat-edge: clip;"
+"Rooms/RoomOpening/+29c+88c/+0+205c/+369c+41c":"cell: bedroom; operation: subtraction;"
+```
+
+The bedroom's clear origin is `(0.1, 0.1, 0.1)` metres and its clear extent is
+`3.46 × 3.10 × 3.71` metres. The annex starts at `(1.60, 0.10, 3.91)` with clear
+extent `1.96 × 3.10 × 2.21` metres. The merged bedroom recovers the 10 cm divider
+between its two column tracks. The rear-left cell has no floor or ceiling;
+boundaries facing that empty space still enclose the adjacent occupied areas.
+These newly exposed walls occupy the reserved `box-partition` thickness and
+use the corresponding directional `box-shell` color and observability. Setting
+that face to `none` also omits its exposed notch walls. Shared walls between
+occupied areas keep the partition color and remain non-observable.
+
+To migrate the two-room scene, replace its two enclosure declarations with
+`Rooms` and add `cell: bedroom` or `cell: annex` to the corresponding direct
+children under `Rooms`. Their interior-relative offsets stay unchanged. Apply
+the cell selection to lights, viewpoints, furniture, tiling, and CSG tools alike.
+Children nested beneath those components use normal parent coordinates.
+
+Numeric selections remain one-based and are not renumbered by omissions. Both
+`cell: 1 1 1` and `cell: 2 1 1` select the entire merged bedroom; `cell: 1 1 2`
+is invalid because that cell is omitted. `cell: all` creates two copies in this
+example. `box-grid-areas: none` restores every atomic cell and its dividers;
+`box-grid: none` clears the whole grid, including tracks and area map.
+
+### Cell surfaces and shared solid geometry
+
+```xyzdsl
+"Cabinet/Lining/+0+10c/+0+10c/+0+1m":"cell: all; surface: walls; model: tile.glb; repeat: x,y; repeat-edge: clip;"
+```
+
+Combining `cell` and `surface` selects the cell before selecting its inward-facing
+boundary surfaces. The existing six face-local coordinate frames apply. Adjacent
+cells can attach different finishes to opposite sides of one divider. Internal
+boundaries exist wherever that axis has a divider; outer boundaries exist only
+where the corresponding shell face exists. Explicit missing-face targets produce
+a diagnostic; `walls` and `all` skip missing faces. Depth fill on an attachment
+uses the selected cell's clear depth normal to that face. Finishes add thickness
+inside the cell but do not further inset the logical cell layout.
+
+The internal divider lattice is rendered as one static solid per enclosure, containing
+only the boundary of the union of its slabs. Shared junctions emit no overlapping
+solids, duplicate coplanar faces, or internal faces. The generated node has
+`surfaceSourceId` pointing to its enclosure and `partitionGrid: true` metadata;
+selecting it selects the enclosure. Cell instances expose one-based
+`cellIndices` metadata identifying the first atomic cell of their logical area.
+Area maps trim outer panels to the occupied footprint and generate exposed
+notch-wall groups at their actual boundary planes. Each group has closed
+outward geometry for CSG. Attachments to a face that borders both outside space
+and another area are clipped into separate visibility segments, while retaining
+the original whole-face coordinates and repetition phase. A tile crossing the
+transition may therefore have two clipped render copies. Direct `surface`
+children without `cell` retain enclosure-wide coordinates and attach only to
+occupied portions of the outer bounding faces; use `cell` to target room-specific
+faces, including notch walls and internal partitions. Individual divider overrides are reserved for a later
+extension; they are not part of this syntax.
+
+Outer-shell observability keeps its existing behavior. Internal dividers are
+always visible, and their attachments do not inherit outer-panel cutaways.
+Attachments on outer cell boundaries follow the corresponding shell panel.
+Tour mode continues to disable observable cutaways for all of these surfaces.
+
+Primitive CSG tools participate in the existing enclosure fan-out: a cut targeting
+an enclosure panel, its partition grid, or an attachment affects overlapping
+panels, the grid solid, and attached finishes of that concrete enclosure.
+Ordinary furniture is not included in that fan-out. Source ordering and target
+selection remain unchanged; the grid uses a conservative interior bounding box
+for candidate selection. Imported finishes use the existing static-model CSG
+path, including quantized geometry handling. Rendering, picking, and collision
+use the actual grid or cut geometry. CSG does not merge cells, change their
+indices, resize their clear extents, or remove their logical attachment frames.
+
+### Validation and bounded generation
+
+Counts and indices must be positive safe integers. Reject malformed values,
+out-of-range selections, missing grid parents, missing partition styles for
+multi-cell grids, and dimensions that leave no positive clear cell space.
+Invalid grids omit their enclosure subtree; invalid cell selections omit that
+child subtree. Diagnostics retain the authored line. Track lengths and fractional
+weights must be finite and positive. Fixed-only tracks must fill the available
+clear length; mixed tracks must leave positive space for the fractional tracks.
+Area maps must match all three track counts, contain at least one occupied cell,
+and assign each name to a complete rectangular cuboid. Unknown names and
+selections of omitted cells produce diagnostics. Arbitrary cell ranges and
+individual divider overrides are not supported.
+
+Before generating each grid instance, reserve `(2×columns−1) × (2×rows−1) ×
+(2×slices−1)` units of the shared 10,000 generated-instance budget. This bounds
+both empty cells and solid lattice blocks, and therefore the boundary mesh work,
+even though the solid renders as one mesh. Area-map grids instead reserve
+`(2×columns+1) × (2×rows+1) × (2×slices+1)` to include the shell layers used by
+the trimmed topology. Generated shell panels, cell placement
+frames, attachment frames, and repeated copies also consume the shared budget.
+Exceeding it omits the containing root subtree atomically and releases that
+subtree's reservation so independent roots can still resolve.
+
+Coverage lives in `src/xyzdsl/boxGrid.test.ts`, `src/xyzdsl/gridTracks.test.ts`,
+`src/scene/partitionGridGeometry.test.ts`, and `src/scene/gridTopology.test.ts`:
+clear dimensions, references, copies,
+attachments, budgets, closed outward geometry without internal faces, CSG,
+picking, and collision.
+
+## Local content deformation
+
+Deformations use the declared, **undeformed** box as a material coordinate frame.
+They do not refit the result into that box. Layout, fill and repetition use the
+original box; primitive selection bounds, picking, collision and CSG use the
+resulting geometry. Apply operations before ordinary placement/rotation.
+
+```text
+"Ring/+805m+141c/+0+12c/+1196m+12c" : "bend: x,z,360"
+"Hook/+0+141c/+0+12c/+0+12c" : "bend: x,z,180,80%..100%"
+"TwistedRing/+0+141c/+0+12c/+0+12c" : "deform: twist(x,180) bend(x,z,360)"
+```
+
+`bend: x,z,180,80%..100%` means bend the last 20% along local X toward +Z,
+through 180 degrees. Negative angles bend toward the opposite direction. The
+ordered axes are the longitudinal axis followed by the transverse direction.
+Twist uses right-handed rotation about its positive longitudinal axis.
+Percentages are measured from the minimum-axis face of the **original** box,
+including after preceding operations. `0%..20%` selects the first end;
+`80%..100%` selects the last end. An omitted interval means `0%..100%`.
+Intervals must increase within those limits. “Last 20% along X” is the intended
+terminology, rather than “20th percentile end.”
+
+### Operations
+
+| Property / expression | Meaning of amount | Behavior |
+| --- | --- | --- |
+| `bend: x,z,90` / `bend(x,z,90)` | Degrees | Curves the centreline and rotates cross-sections with it |
+| `twist: x,180` / `twist(x,180)` | Degrees | Rotates cross-sections progressively around X |
+| `taper: x,.5` / `taper(x,.5)` | End cross-section factor | Changes both transverse dimensions from 1 to the factor |
+| `bulge: x,2` / `bulge(x,2)` | Middle cross-section factor | Smooth sin² rise/fall, returning to 1 at both interval boundaries |
+| `shear: x,z,12c` / `shear(x,z,12c)` | Total transverse displacement | Slides parallel cross-sections toward Z |
+| `stretch: x,2` / `stretch(x,2)` | Selected length factor | Doubles the selected interval's centreline length |
+| `offset: x,z,12c` / `offset(x,z,12c)` | Total transverse displacement | Smooth sideways jog, with parallel straight continuations |
+| `wave: x,z,5c,2` / `wave(x,z,5c,2)` | Amplitude, integer cycles | Sinusoidal transverse displacement; cross-sections remain parallel |
+
+Every operation accepts one optional final `start%..end%` argument. `flare`
+is an alias for `taper`, `pinch` for `bulge`, `compress` for `stretch`, and `jog`
+for `offset`. Aliases use the same factor semantics: `compress: x,.5` halves
+length; `pinch: x,.5` halves both transverse dimensions at the middle.
+Displacement units follow XYZDSL: bare metres, `d` decimetres, `c` centimetres,
+and `m` millimetres. Factors are dimensionless, from 0.01 through 100. Angles
+are finite degrees, limited to ±3600; wave cycles are integers from 1 through 32.
+
+Use **one shorthand** or **one `deform` expression** on an object. A chain has
+at most eight operations, executed left to right, in the original local axis
+frame. Each operation uses original material coordinates for interval membership
+and its longitudinal parameter, while transforming the already-deformed point.
+Changing order therefore changes the result. Duplicate properties use the last
+value. Mixing different shorthand properties or shorthand with `deform` reports
+a diagnostic; there is no hidden operation order. `deform: none` explicitly
+clears a copied/reference deformation. It does not exempt a child from a
+parent's shared deformation frame.
+
+### Section continuity and profiles
+
+Before a selected interval the geometry is unchanged. Bend carries the
+continuation at its final angle; twist carries its final rotation; stretch
+translates the remaining length; shear and jog carry the remaining length
+sideways. Taper carries its final cross-section scale. Bulge/pinch returns to
+its original cross-section. Integer-cycle waves return to zero displacement.
+
+`deform-profile: linear` is the default. It gives constant bend curvature,
+twist rate, taper rate and axial stretch. `deform-profile: smooth` uses
+smoothstep progression for bend/twist/taper/shear: bends keep the requested
+total angle while curvature eases in and out. Smooth stretch has positive,
+smooth axial strain integrating to the requested length factor. Offset always
+uses smoothstep; bulge always uses a sin² envelope. Smooth wave adds a sin²
+amplitude envelope so its slope also vanishes at both boundaries.
+
+A 360-degree **constant-curvature** bend closes a ring. A smooth curvature
+profile with the same total turning angle generally does **not** close its
+centreline. For plain boxes, matching full-circle end cross-sections have their
+end caps removed automatically, including compatible twist-then-bend chains.
+The coincident seam retains split UVs and corresponding normals. Tapered or
+incompatibly twisted ends remain capped rather than claiming a closed solid.
+Rounded primitives and imported models retain their original end topology.
+
+### Volume coupling
+
+`deform-volume: free` is the default: axial and transverse changes are independent.
+`deform-volume: preserve` couples stretch to inverse square-root transverse
+scaling, and taper/bulge to inverse-square longitudinal strain. Thus uniform
+stretch by 2 scales both transverse axes by `1/sqrt(2)`, while compression by
+0.5 scales them by `sqrt(2)`. Taper's longitudinal compensation continues with
+its final cross-section scale after the selected interval; bulge's continuation
+is translated because its final cross-section factor is 1.
+
+A **partial** volume-preserving stretch automatically eases its axial strain
+back to 1 at the section boundaries to keep the adjoining material connected.
+The requested factor still specifies total selected length; narrowing/widening
+is strongest inside the section. Smooth axial strain has an analytic integral; cross-section compensation uses
+numerical integration, preserving volume within mesh tessellation accuracy. This is a geometric constraint, not
+elasticity or a material simulation. It couples stretch/taper/bulge; it does not
+turn arbitrary composed bends into an incompressible physical simulation.
+
+### Hierarchies, assets and limits
+
+A concrete parent's deformation wraps its assembled descendants in one shared
+frame; it is not inherited as a separate modifier on each child. Local child
+operations run first, followed by parent operations, up to sixteen nested
+frames. References copy the structural operation, can replace/reset it, and
+retain the original layout/reference scaling contract. Namespace-only styles
+with deformation apply only to concrete instances of that exact namespace,
+not independently to all descendants. Enclosure panels may deform together
+through their concrete shell owner.
+
+Primitive and static imported mesh geometry is subdivided along deformation
+axes, including exact section boundaries. UVs, colors and material groups are
+interpolated; normals are transformed with the deformation Jacobian. Shared
+model buffers are never modified. Static models deform after orientation and
+fitting and before CSG. Picking and collision use their actual deformed meshes;
+model selection/camera bounds use the deformed target-box envelope, which can
+be looser than the fitted model. Imported skinning, instancing and morph targets
+report an error rather than silently deforming incorrectly.
+
+Live text/URL cards, lights/viewpoints and clipped repetition inside a deformed
+subtree are unsupported and diagnosed. Use `repeat-edge: whole` for deformation.
+Path-following remains a future extension. Mesh generation has a 200,000-triangle
+budget per mesh and validates finite results. Bend radii that reach the inner
+surface and angles exceeding a full turn produce self-intersection warnings.
+The multi-turn warning is omitted for a two-operation, linear, full-length
+outward shear-then-bend spiral when its starting inner radius is positive and
+its radial spacing per turn exceeds the transverse thickness. Other chains
+retain the conservative warning; this is not a general collision or
+arbitrary-composition fold detector.
+
+For example, this three-turn spiral has 20 cm radial spacing and 12 cm thickness:
+
+```text
+"Spiral/+805m+141c/+0+12c/+1196m+12c" : "deform: shear(x,z,-60c) bend(x,z,1080)"
+```
+
+Use opposite signs for shear and bend to expand outward. Reversing both signs
+reverses the winding. A bend alone beyond 360 degrees retraces the same circle.
+
+Executable examples: `docs/examples/deformations.xyzdsl`. The browser review
+at `/tests/fixtures/deformations.html` displays the actual production geometry,
+including the ring, terminal hook, twist, taper, bulge, pinch, shear, volume-coupled
+section stretch, jog and wave.
+
+## Rigid-body force experiments
+
+The initial runtime is a custom TypeScript solver in `src/physics`, using
+Three.js for vector/quaternion mathematics and rendering. No external physics
+engine is currently used. Reevaluate that choice before adding collision
+response, bonds, or joint constraints; the DSL and compiled body/action data
+should remain independent of the solver.
+
+Runnable source examples and usage instructions are in
+[First physics experiments](docs/examples/physics/README.md).
+
+Physics is opt-in through `body: rigid; mass: 2` on a concrete, plain box
+leaf. Mass is positive kilograms; the box is uniformly dense, with its center
+of mass at its geometric center and inertia calculated from its dimensions.
+Other geometry remains ordinary scene geometry. This first contract has no
+contacts, ground plane, friction, bonds, joints, or deformation under load.
+Bodies can pass through scene geometry and one another.
+
+```text
+"Experiment/+0+2/+0+2/+0+2" : "gravity: 0,-9.81,0"
+"Experiment/Block/+50c+20c/+1+20c/+50c+20c" : "body: rigid; mass: 2"
+"Experiment/+Block" : "action: force; vector: 10,0,0; point: center; duration: 1"
+```
+
+An action target uses a `+` prefix on the recipient name, optionally followed
+by three point coordinates. The parser classifies this as an action address
+before ordinary object replacement or namespace inheritance. `action: force`
+is still required to specify the action type. For example:
+
+```text
+"Experiment/+Offset/+70c/+140c/+140c" : "action: force; vector: 2,0,0; duration: 1"
+"Experiment/+Offset" : "action: force; vector: 2,0,0; point: top; duration: 1"
+```
+
+The target is `Experiment/Offset`. Each coordinate is `+position`, without a
+size. All three are required when present. Coordinates use the existing
+nonnegative, unpadded integer path lengths with optional `d`, `c`, or `m`
+suffixes; fractions can be expressed in smaller units. Nested namespaces and
+top-level recipients (`+Block`) are supported. Internal plus signs in names
+such as `Block+1` retain their ordinary meaning. A leading plus is reserved for
+action recipients and cannot declare geometry or defaults.
+
+`point` is reserved for named locations on explicit action paths: `center`
+(default), `left` (-X), `right` (+X), `bottom` (-Y), `top` (+Y), `front` (-Z),
+and `back` (+Z). These select the center or face centers in the body's own
+axes, so they follow its orientation. Supplying both coordinate segments and
+`point` is an error.
+
+The earlier unprefixed body-addressed form remains compatible, including its
+numeric `point` property. New documents should use explicit `+Body` targets.
+Each action is an additive record, not a namespace default or replacement declaration.
+Multiple actions accumulate, including declarations before the body. Actions
+resolve against the completed document and never inherit into children. Body
+and mass must be on the concrete declaration and also do not inherit. An
+unresolved action target or unsupported body produces a diagnostic.
+
+`vector` is a finite three-component force in newtons. `duration` is positive
+seconds. All actions begin at simulation time zero and end at their duration;
+forces ending between simulation steps are integrated up to that boundary.
+A path point is a position in the owning component's local authoring space at
+the initial pose, not an offset from the recipient's origin. The legacy numeric
+`point` property uses that same frame and accepts signed decimal lengths with
+existing units: bare metres, `d` decimetres, `c` centimetres, and `m` millimetres.
+The point is attached to the body and moves with it. Force directions use the owning component's initial orientation and
+do not rotate with the target body. Off-center forces produce torque as well
+as translation. Top-level bodies use world coordinates.
+
+`gravity` is a three-component acceleration in metres per second squared.
+It may be declared on a concrete component; the nearest declared field applies
+to each body, in that component's initial orientation. With no declaration,
+gravity is world `(0,-9.81,0)`. `gravity: 0,0,0` disables it. Components do not
+acquire mass simply by containing bodies. Gravity on a body is also accepted,
+using its initial orientation, without inheritance into unrelated bodies.
+
+Explorer exposes Play/Pause, a 1/120-second Step, and Reset when supported bodies
+exist. Initial velocities are zero. Editing the document resets the experiment
+and pauses it. Runtime transforms never overwrite authored source. The overlay
+shows linear and angular velocity, recent center-of-mass trails, and net force
+arrows starting outside each body (0.04 scene metres per newton, capped at 0.8
+metres). Physics scenes add inspection lighting and frame the initial bodies.
+Physics advances at 120 Hz, with at most 0.1 seconds of catch-up per rendered frame. Rotation uses
+world angular momentum and the rotated box inertia tensor; it is a numerical
+approximation, not a precision engineering solver.
+
+The first version supports plain box leaves under unscaled components.
+Container bodies, nested bodies, rounded/deformed boxes, imported models,
+content, lights, viewpoints, CSG, surfaces, grids, references, and repetitions
+are not supported as simulated bodies. Unsupported combinations diagnose rather
+than silently approximate their inertia or duplicate action bindings. Ordinary
+non-physics scenes retain their existing behavior. Torque/impulse declarations,
+action identifiers, triggers, and deformable bodies are future extensions.
+
+### Follow-up: reevaluate declaration replacement and inheritance
+
+Revisit the existing replacement and inheritance rules in a dedicated language
+review. Body-addressed actions now add records at an existing object path,
+whereas ordinary declarations retain their existing replacement/default
+behavior. Evaluate whether the language should explicitly distinguish object
+creation/replacement, property updates, inherited defaults, and additive
+behaviors. Include duplicate paths, declaration ordering, action identity and
+removal, reference/repetition behavior, and migration of existing documents.
+This is a follow-up design task, not a change to those existing rules in the
+initial physics contract.

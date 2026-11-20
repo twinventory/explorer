@@ -1,0 +1,3 @@
+"Experiment/+0+3/+0+3/+0+2" : ""
+"Experiment/Light/+50c+20c/+2+20c/+50c+20c" : "body: rigid; mass: 1; color: orange"
+"Experiment/Heavy/+150c+20c/+2+20c/+50c+20c" : "body: rigid; mass: 5; color: cyan"
